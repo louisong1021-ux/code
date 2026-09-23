@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from datetime import date
 from unittest.mock import Mock, patch
 
@@ -6,6 +8,54 @@ import ChineseInLA_local_scraper_cli as app
 
 
 class TodaySyncTests(unittest.TestCase):
+    def test_parameter_page_dates(self):
+        for title in ("2026-09-22", "任务 2026/9/22", "2026年9月22日 招聘"):
+            self.assertEqual(app.date_from_title(title), date(2026, 9, 22))
+        for title in ("招聘监控", "2026-02-30", "2026-09-21 到 2026-09-22"):
+            with self.assertRaises(ValueError):
+                app.date_from_title(title)
+
+    def test_parameter_page_id_and_link(self):
+        expected = "3e0c18c6-fba4-8125-861c-fc246bbb0092"
+        for value in (expected, expected.replace("-", ""),
+                      "https://www.notion.so/Date-" + expected.replace("-", "") + "?source=copy_link"):
+            self.assertEqual(app.notion_page_id(value), expected)
+        with self.assertRaises(ValueError):
+            app.notion_page_id("https://example.com/" + expected)
+
+    def test_source_page_read_is_get_only(self):
+        with patch.object(app, "load_notion_token", return_value="dummy"), \
+                patch.object(app.NotionWriter, "request", return_value={"properties": {
+                    "title": {"type": "title", "title": [{"plain_text": "2026-09-22"}]}}}) as request:
+            self.assertEqual(app.read_date_page(app.NOTION_PAGE_ID), date(2026, 9, 22))
+            request.assert_called_once_with("GET", "pages/" + app.NOTION_PAGE_ID)
+
+    def test_historical_date_propagates_through_run(self):
+        target = date(2025, 1, 2)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(app, "RESULT_JSON", Path(directory) / "result.json"), \
+                patch.object(app, "read_date_page", return_value=target), \
+                patch.object(app, "NotionWriter") as factory, \
+                patch.object(app, "crawl_live", return_value=([], {})) as crawl, \
+                patch("builtins.print"):
+            writer = factory.return_value
+            writer.count = 0
+            writer.daily_page_id = None
+            result = app.run(date_page=app.NOTION_PAGE_ID)
+            factory.assert_called_once_with(target, guard_midnight=False)
+            crawl.assert_called_once_with(target, writer)
+            self.assertEqual(result["target_date"], "2025-01-02")
+
+    def test_explicit_historical_date_can_write(self):
+        with patch.object(app, "load_notion_token", return_value="dummy"):
+            writer = app.NotionWriter(date(2025, 1, 2), guard_midnight=False)
+        writer.daily_page_id = "historical-day"
+        writer.request = Mock(return_value={"results": [{}, {}]})
+        writer.write({"发布时间": "2025/01/02", "标题": "历史招聘", "详情URL": "https://example.com/job"})
+        self.assertEqual(writer.count, 1)
+        self.assertEqual(writer.request.call_args.args[1], "blocks/historical-day/children")
+        writer.close()
+
     def test_refresh_dates_are_strict(self):
         today = date(2026, 9, 23)
         for value in ("2026/09/23, 8:12 am", "2026-9-23 11:59 pm"):

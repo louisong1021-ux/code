@@ -1,11 +1,11 @@
 """
-ChineseInLA 招聘采集：仅收录洛杉矶当天刷新或发布的帖子。
+ChineseInLA 招聘采集：收录目标日期刷新或发布的帖子；默认洛杉矶当天。
 
-依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是当天即收录。
+依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是目标日期即收录。
 默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，逐条追加；保留本地 CSV 和旧内容。
 保持原有类型筛选、网页顺序和单次扫描行为，不以旧帖提前停止分页。
-重复运行可能重复追加。两个日期均非当天或无效的帖子跳过。
-跨洛杉矶午夜停止 Notion 写入，避免日期混淆。
+重复运行可能重复追加。两个日期均非目标日期或无效的帖子跳过。
+默认当天模式跨午夜停止写入；--date-page 指定日期模式始终使用参数日期。
 
 依赖：pip install requests lxml tzdata
 凭据：同目录 notion_token.txt 或 NOTION_TOKEN 环境变量，勿提交到 Git。
@@ -22,11 +22,12 @@ import random
 import re
 import time
 import threading
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 try:
@@ -223,10 +224,57 @@ def recruitment_block(row: dict[str, str]) -> dict:
         "rich_text": notion_text(row.get("标题", "招聘信息")[:1800]), "children": children}}
 
 
+def notion_page_id(value: str) -> str:
+    value = value.strip()
+    if "://" in value:
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or not parsed.hostname or not (
+            parsed.hostname in {"notion.so", "notion.site", "notion.com"}
+            or parsed.hostname.endswith((".notion.so", ".notion.site", ".notion.com"))
+        ):
+            raise ValueError("--date-page 必须是 Notion HTTPS 页面链接或页面 ID")
+        value = parsed.path.rstrip("/").split("/")[-1]
+    match = re.search(r"([0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$", value)
+    if not match:
+        raise ValueError("无法从 --date-page 提取 Notion 页面 ID")
+    return str(uuid.UUID(match.group(1)))
+
+
+def page_title(page: dict) -> str:
+    return "".join(t.get("plain_text", t.get("text", {}).get("content", ""))
+                   for prop in page.get("properties", {}).values()
+                   if prop.get("type") == "title" for t in prop.get("title", []))
+
+
+def date_from_title(title: str) -> date:
+    values = re.findall(r"(?<!\d)(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})(?:日)?(?!\d)", title)
+    try:
+        dates = {date(*(int(part) for part in value)) for value in values}
+    except ValueError as exc:
+        raise ValueError("参数页面标题包含无效日期") from exc
+    if len(dates) != 1:
+        raise ValueError("参数页面标题必须包含唯一日期，例如 2026-09-22")
+    return dates.pop()
+
+
+def read_date_page(value: str) -> date:
+    source_id = notion_page_id(value)
+    reader = NotionWriter(datetime.now(LA_TZ).date())
+    try:
+        page = reader.request("GET", "pages/" + source_id)
+        if page.get("archived") or page.get("in_trash"):
+            raise ValueError("参数页面已归档或在回收站中")
+        return date_from_title(page_title(page))
+    finally:
+        reader.close()
+
+
 class NotionWriter:
     """追加本轮结果，不删除页面现有内容。写入不自动重试以免重复追加。"""
-    def __init__(self, target: date):
+    def __init__(self, target: date, guard_midnight=True):
         self.target = target
+        self.guard_midnight = guard_midnight
+        self.started_date = datetime.now(LA_TZ).date()
         self.count = 0
         self.daily_page_id = None
         self.session = requests.Session()
@@ -242,9 +290,7 @@ class NotionWriter:
 
     def check_page(self):
         page = self.request("GET", "pages/" + NOTION_PAGE_ID)
-        title = "".join(t.get("plain_text", t.get("text", {}).get("content", ""))
-                        for prop in page.get("properties", {}).values()
-                        if prop.get("type") == "title" for t in prop.get("title", []))
+        title = page_title(page)
         if title != "招聘信息监控":
             raise RuntimeError("目标页面标题不匹配，拒绝写入")
 
@@ -281,14 +327,14 @@ class NotionWriter:
         return self.daily_page_id
 
     def write(self, row):
-        if datetime.now(LA_TZ).date() != self.target:
+        if self.guard_midnight and datetime.now(LA_TZ).date() != self.started_date:
             raise RuntimeError("已跨过洛杉矶午夜，停止写入；请重新运行以抓取新的一天")
         if not matches_day(row, self.target):
-            raise ValueError("拒绝写入非当天刷新或发布的帖子")
+            raise ValueError("拒绝写入非目标日期刷新或发布的帖子")
         blocks = [recruitment_block(row)]
         if self.count == 0:
             blocks.insert(0, {"object": "block", "type": "heading_2", "heading_2": {
-                "rich_text": notion_text(f"当天刷新或发布招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%H:%M:%S %Z}")}})
+                "rich_text": notion_text(f"刷新或发布招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%Y-%m-%d %H:%M:%S %Z}")}})
         page_id = self.ensure_daily_page()
         result = self.request("PATCH", "blocks/" + page_id + "/children", json={"children": blocks})
         if len(result.get("results", [])) != len(blocks):
@@ -2323,7 +2369,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
             if not matches_day(row, target_date):
                 stats["date_skipped"] = int(stats["date_skipped"]) + 1
                 page_skipped += 1
-                _log("跳过", f"ID {post_id} | 刷新与发布均非当天或日期无效 | {row.get('刷新时间') or '空'}")
+                _log("跳过", f"ID {post_id} | 刷新与发布均非目标日期或日期无效 | {row.get('刷新时间') or '空'}")
                 continue
 
             if not type_allowed(job_type):
@@ -2380,17 +2426,18 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
 # 主程序
 # ============================================================
 
-def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
-    """抓取洛杉矶当天刷新或发布记录，默认追加到招聘信息监控页面。"""
+def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = None) -> dict:
+    """抓取参数页面日期或洛杉矶当天的记录，写入日期子页面。"""
     if clear_stop:
         STOP_EVENT.clear()
 
     run_started_at = datetime.now(LA_TZ)
+    target_date = read_date_page(date_page) if date_page is not None else run_started_at.date()
     started_perf = time.perf_counter()
 
     print("=" * 76)
-    _log("开始", "ChineseInLA 招聘采集 | 当天刷新或发布 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
-    _log("日期", f"{run_started_at.date()} | America/Los_Angeles | 刷新或发布任一日期为当天即纳入")
+    _log("开始", "ChineseInLA 招聘采集 | 指定日期刷新或发布 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
+    _log("日期", f"{target_date} | America/Los_Angeles | 来源={'Notion 页面标题' if date_page else '当天'}")
     _log("配置", f"类型={JOB_TYPE_FILTER} | 跳过置顶={'是' if SKIP_PINNED else '否'}")
     _log(
         "配置",
@@ -2401,11 +2448,11 @@ def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
     _log("规则", "不读取历史、不去重、按网页顺序、每条成功后立即写入")
     print("=" * 76)
 
-    writer = None if local_only else NotionWriter(run_started_at.date())
+    writer = None if local_only else NotionWriter(target_date, guard_midnight=date_page is None)
     try:
         if writer is not None:
             writer.check_page()
-        rows, stats = crawl_live(run_started_at.date(), writer)
+        rows, stats = crawl_live(target_date, writer)
     finally:
         if writer is not None:
             writer.close()
@@ -2427,8 +2474,9 @@ def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
     status_text = "已停止" if stop_reason == "user_stop" else "已完成"
 
     result = {
-        "mode": "today_refreshed_or_published_single_run",
-        "target_date": str(run_started_at.date()),
+        "mode": "date_refreshed_or_published_single_run",
+        "target_date": str(target_date),
+        "date_source_page_id": notion_page_id(date_page) if date_page is not None else None,
         "notion_page_id": None if local_only else NOTION_PAGE_ID,
         "notion_daily_page_id": None if writer is None else writer.daily_page_id,
         "notion_written": 0 if writer is None else writer.count,
@@ -2489,10 +2537,11 @@ def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
 def run_cli() -> None:
     """执行一次采集后结束；无需桌面界面。"""
     parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新或发布的招聘信息并追加到 Notion")
-    parser.add_argument("--local-only", action="store_true", help="仅抓取并保存 CSV，不访问 Notion")
+    parser.add_argument("--local-only", action="store_true", help="仅保存 CSV，不写 Notion；传 --date-page 时仍读取参数页面")
+    parser.add_argument("--date-page", metavar="URL_OR_ID", help="读取指定 Notion 页面标题中的日期；不传则使用洛杉矶当天")
     args = parser.parse_args()
     try:
-        run(local_only=args.local_only)
+        run(local_only=args.local_only, date_page=args.date_page)
     except KeyboardInterrupt:
         STOP_EVENT.set()
         print("\n用户中止。")
