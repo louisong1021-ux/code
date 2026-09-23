@@ -8,6 +8,31 @@ import ChineseInLA_local_scraper_cli as app
 
 
 class TodaySyncTests(unittest.TestCase):
+    def test_old_normal_page_stops_without_following_page(self):
+        today = date(2026, 9, 23)
+        pinned = {"帖子ID": "1", "标题": "Pinned", "置顶": "是", "刷新时间": "2026/09/23"}
+        old = {"帖子ID": "2", "标题": "Old", "发布时间": "2026/09/22"}
+        app.STOP_EVENT.clear()
+        with patch.object(app, "fetch_html", return_value="<html></html>") as fetch, \
+                patch.object(app, "extract_topic_links", return_value=[pinned, old]), \
+                patch.object(app, "process_topic", side_effect=[(pinned, "招聘"), (old, "招聘")]), \
+                patch.object(app, "type_allowed", return_value=True), \
+                patch.object(app, "ensure_csv_header"), patch.object(app, "append_csv_row"), \
+                patch.object(app, "_log"), patch.object(app, "_log_captured_row"):
+            rows, stats = app.crawl_live(today)
+        self.assertEqual(rows, [pinned])
+        self.assertEqual(stats["stop_reason"], "target_date_boundary")
+        self.assertEqual(stats["date_boundary_reached"], 1)
+        fetch.assert_called_once()
+
+    def test_boundary_requires_known_old_dates(self):
+        today = date(2026, 9, 23)
+        for row in ({}, {"发布时间": "bad"}, {"发布时间": "2026/09/22", "刷新时间": "2026/09/23"},
+                    {"发布时间": "2026/09/24"}):
+            self.assertFalse(app.older_than_target(row, today))
+        self.assertTrue(app.older_than_target({"发布时间": "2026/09/22"}, today))
+        self.assertFalse(app.older_than_target({"发布时间": "2026/09/22"}, date(2026, 9, 21)))
+
     @staticmethod
     def parameter_blocks(*lines):
         return [{"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": line}]}} for line in lines]

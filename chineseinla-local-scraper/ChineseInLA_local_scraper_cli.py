@@ -3,7 +3,7 @@ ChineseInLA 招聘采集：收录目标日期刷新或发布的帖子；默认�
 
 依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是目标日期即收录。
 默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，逐条追加；保留本地 CSV 和旧内容。
-每轮读取 Notion 参数页的间隔和日期，持续循环；保持类型筛选、网页顺序，不以旧帖提前停止分页。
+每轮读取 Notion 参数页的间隔和日期，持续循环；保持类型筛选、网页顺序，本页普通帖子均早于目标日期时停止翻页。
 重复运行可能重复追加。两个日期均非目标日期或无效的帖子跳过。
 默认当天模式跨午夜停止写入；--date-page 指定日期模式始终使用参数日期。
 
@@ -251,6 +251,23 @@ def date_matches(value: str, target: date) -> bool:
 def matches_day(row: dict[str, str], target: date) -> bool:
     return any(date_matches(row.get(field, ""), target)
                for field in ("刷新时间", "发布时间"))
+
+
+def older_than_target(row, target):
+    """两个有效日期均早于目标日才确认越界；缺失刷新时间可用发布日期判断。"""
+    dates = []
+    for field in ("刷新时间", "发布时间"):
+        value = (row.get(field) or "").strip()
+        if not value:
+            continue
+        match = re.match(r"^(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?=\D|$)", value)
+        if not match:
+            return False
+        try:
+            dates.append(date(*(int(part) for part in match.groups())))
+        except ValueError:
+            return False
+    return bool(dates) and max(dates) < target
 
 
 def load_notion_token() -> str:
@@ -2312,6 +2329,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
         "list_failed": 0,
         "type_skipped": 0,
         "date_skipped": 0,
+        "date_boundary_reached": 0,
         "invalid": 0,
         "pinned_found": 0,
         "normal_found": 0,
@@ -2338,6 +2356,8 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
         page_skipped = 0
         page_failed = 0
         page_invalid = 0
+        normal_seen = 0
+        all_normal_older = True
 
         try:
             doc = html.fromstring(fetch_html(url))
@@ -2406,12 +2426,15 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
             title = clean(item.get("标题"))
 
             if not post_id:
+                all_normal_older = False
                 stats["invalid"] = int(stats["invalid"]) + 1
                 page_invalid += 1
                 _log("跳过", f"第 {page} 页 | 缺少帖子 ID | {_short_text(title)}")
                 continue
 
             item_is_pinned = clean(item.get("置顶")) == "是"
+            if not item_is_pinned:
+                normal_seen += 1
 
             try:
                 row, job_type = process_topic(item, target_date=target_date)
@@ -2424,6 +2447,8 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
                 KeyError,
                 requests.RequestException,
             ) as exc:
+                if not item_is_pinned:
+                    all_normal_older = False
                 stats["detail_failed"] = int(stats["detail_failed"]) + 1
                 page_failed += 1
                 _log(
@@ -2431,6 +2456,9 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
                     f"ID {post_id} | {_short_text(title)} | {type(exc).__name__}: {exc}",
                 )
                 continue
+
+            if not item_is_pinned and not older_than_target(row, target_date):
+                all_normal_older = False
 
             if not matches_day(row, target_date):
                 stats["date_skipped"] = int(stats["date_skipped"]) + 1
@@ -2476,6 +2504,11 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
             f"累计 {int(stats['written'])}",
         )
 
+        if normal_seen > 0 and all_normal_older and not STOP_EVENT.is_set():
+            stop_reason = "target_date_boundary"
+            stats["date_boundary_reached"] = 1
+            _log("结束", f"第 {page} 页普通帖子均早于 {target_date}，已越过目标日期，停止翻页")
+            break
         page += 1
 
     if STOP_EVENT.is_set():
@@ -2548,6 +2581,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         "repeated_page": "检测到重复分页，安全停止",
         "consecutive_empty_or_failed": "连续空页或列表读取失败，判定已到末端",
         "forum_end": "论坛分页已扫描到底",
+        "target_date_boundary": "已越过目标日期，停止扫描旧帖",
     }.get(stop_reason, stop_reason or "正常结束")
 
     status_text = "已停止" if stop_reason == "user_stop" else "已完成"
