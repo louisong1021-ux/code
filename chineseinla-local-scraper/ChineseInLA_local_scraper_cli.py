@@ -2432,12 +2432,23 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         STOP_EVENT.clear()
 
     run_started_at = datetime.now(LA_TZ)
-    target_date = read_date_page(date_page) if date_page is not None else run_started_at.date()
+    target_date = run_started_at.date()
+    source_page_id = None
+    date_fallback = False
+    if date_page and date_page.strip():
+        try:
+            target_date = read_date_page(date_page)
+            source_page_id = notion_page_id(date_page)
+        except Exception as exc:
+            # 参数读取失败不影响当天采集；不捕获用户中断或系统退出。
+            target_date = datetime.now(LA_TZ).date()
+            date_fallback = True
+            _log("警告", f"日期参数读取失败（{type(exc).__name__}），自动使用洛杉矶当天 {target_date}")
     started_perf = time.perf_counter()
 
     print("=" * 76)
     _log("开始", "ChineseInLA 招聘采集 | 指定日期刷新或发布 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
-    _log("日期", f"{target_date} | America/Los_Angeles | 来源={'Notion 页面标题' if date_page else '当天'}")
+    _log("日期", f"{target_date} | America/Los_Angeles | 来源={'Notion 页面标题' if source_page_id else '当天'}")
     _log("配置", f"类型={JOB_TYPE_FILTER} | 跳过置顶={'是' if SKIP_PINNED else '否'}")
     _log(
         "配置",
@@ -2448,7 +2459,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
     _log("规则", "不读取历史、不去重、按网页顺序、每条成功后立即写入")
     print("=" * 76)
 
-    writer = None if local_only else NotionWriter(target_date, guard_midnight=date_page is None)
+    writer = None if local_only else NotionWriter(target_date, guard_midnight=source_page_id is None)
     try:
         if writer is not None:
             writer.check_page()
@@ -2476,7 +2487,8 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
     result = {
         "mode": "date_refreshed_or_published_single_run",
         "target_date": str(target_date),
-        "date_source_page_id": notion_page_id(date_page) if date_page is not None else None,
+        "date_source_page_id": source_page_id,
+        "date_parameter_fallback": date_fallback,
         "notion_page_id": None if local_only else NOTION_PAGE_ID,
         "notion_daily_page_id": None if writer is None else writer.daily_page_id,
         "notion_written": 0 if writer is None else writer.count,

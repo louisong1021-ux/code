@@ -8,6 +8,38 @@ import ChineseInLA_local_scraper_cli as app
 
 
 class TodaySyncTests(unittest.TestCase):
+    def test_parameter_errors_fall_back_to_today(self):
+        for error in (ValueError("invalid date"), RuntimeError("page denied"),
+                      app.requests.Timeout("timeout")):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(app, "RESULT_JSON", Path(directory) / "result.json"), \
+                    patch.object(app, "read_date_page", side_effect=error), \
+                    patch.object(app, "NotionWriter") as factory, \
+                    patch.object(app, "crawl_live", return_value=([], {})) as crawl, \
+                    patch("builtins.print"):
+                writer = factory.return_value
+                writer.count = 0
+                writer.daily_page_id = None
+                result = app.run(date_page="invalid-input")
+                today = app.datetime.now(app.LA_TZ).date()
+                factory.assert_called_once_with(today, guard_midnight=True)
+                crawl.assert_called_once_with(today, writer)
+                self.assertEqual(result["target_date"], str(today))
+                self.assertIsNone(result["date_source_page_id"])
+                self.assertTrue(result["date_parameter_fallback"])
+
+    def test_empty_parameter_uses_today_without_reading_page(self):
+        for value in (None, "", "  "):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(app, "RESULT_JSON", Path(directory) / "result.json"), \
+                    patch.object(app, "read_date_page") as read, \
+                    patch.object(app, "crawl_live", return_value=([], {})) as crawl, \
+                    patch("builtins.print"):
+                result = app.run(date_page=value, local_only=True)
+                read.assert_not_called()
+                crawl.assert_called_once_with(app.datetime.now(app.LA_TZ).date(), None)
+                self.assertFalse(result["date_parameter_fallback"])
+
     def test_parameter_page_dates(self):
         for title in ("2026-09-22", "任务 2026/9/22", "2026年9月22日 招聘"):
             self.assertEqual(app.date_from_title(title), date(2026, 9, 22))
