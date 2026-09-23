@@ -8,6 +8,49 @@ import ChineseInLA_local_scraper_cli as app
 
 
 class TodaySyncTests(unittest.TestCase):
+    @staticmethod
+    def parameter_blocks(*lines):
+        return [{"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": line}]}} for line in lines]
+
+    def test_two_parameters_and_independent_defaults(self):
+        self.assertEqual(app.parse_parameters(self.parameter_blocks("循环间隔（分钟）：55.5", "日期：2026-09-22")),
+                         (3330, date(2026, 9, 22)))
+        self.assertEqual(app.parse_parameters(self.parameter_blocks("循环间隔（分钟）：bad", "日期：2026-09-22")),
+                         (3600, date(2026, 9, 22)))
+        self.assertEqual(app.parse_parameters(self.parameter_blocks("循环间隔（分钟）：15", "日期：2026-02-30")),
+                         (900, None))
+        for invalid in ("0", "-5", "nan", "inf", ""):
+            self.assertEqual(app.parse_parameters(self.parameter_blocks("循环间隔（分钟）：" + invalid, "日期：当天")), (3600, None))
+        self.assertEqual(app.parse_parameters(self.parameter_blocks("日期：2026-09-21", "日期：2026-09-22")), (3600, None))
+
+    def test_parameter_read_errors_are_silent(self):
+        with patch.object(app, "load_notion_token", side_effect=RuntimeError("private error")), patch("builtins.print") as output:
+            self.assertEqual(app.read_parameters(), (3600, None))
+            output.assert_not_called()
+
+    def test_loop_reads_changed_parameters_and_survives_failure(self):
+        app.STOP_EVENT.clear()
+        waits = []
+        def wait(seconds):
+            waits.append(seconds)
+            if len(waits) == 2:
+                app.STOP_EVENT.set()
+        with patch.object(app, "read_parameters", side_effect=[(60, date(2026, 9, 21)), (120, None)]), \
+                patch.object(app, "run", side_effect=[RuntimeError("hidden"), {}]) as run, \
+                patch.object(app.STOP_EVENT, "wait", side_effect=wait), patch("builtins.print") as output:
+            self.assertEqual(app.run_continuously(), 0)
+            self.assertEqual(waits, [60, 120])
+            self.assertEqual(run.call_args_list[0].kwargs["configured_date"], date(2026, 9, 21))
+            self.assertIsNone(run.call_args_list[1].kwargs["configured_date"])
+            self.assertNotIn("hidden", str(output.call_args_list))
+        app.STOP_EVENT.clear()
+
+    def test_once_does_not_wait(self):
+        with patch.object(app, "read_parameters", return_value=(3600, None)), \
+                patch.object(app, "run", return_value={}), patch.object(app.STOP_EVENT, "wait") as wait:
+            self.assertEqual(app.run_continuously(once=True), 0)
+            wait.assert_not_called()
+
     def test_parameter_errors_fall_back_to_today(self):
         for error in (ValueError("invalid date"), RuntimeError("page denied"),
                       app.requests.Timeout("timeout")):

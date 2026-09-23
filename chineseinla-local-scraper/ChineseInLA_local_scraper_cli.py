@@ -3,13 +3,13 @@ ChineseInLA 招聘采集：收录目标日期刷新或发布的帖子；默认�
 
 依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是目标日期即收录。
 默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，逐条追加；保留本地 CSV 和旧内容。
-保持原有类型筛选、网页顺序和单次扫描行为，不以旧帖提前停止分页。
+每轮读取 Notion 参数页的间隔和日期，持续循环；保持类型筛选、网页顺序，不以旧帖提前停止分页。
 重复运行可能重复追加。两个日期均非目标日期或无效的帖子跳过。
 默认当天模式跨午夜停止写入；--date-page 指定日期模式始终使用参数日期。
 
 依赖：pip install requests lxml tzdata
 凭据：同目录 notion_token.txt 或 NOTION_TOKEN 环境变量，勿提交到 Git。
-仅本地测试：python ChineseInLA_local_scraper_cli.py --local-only
+仅本地单次测试：python ChineseInLA_local_scraper_cli.py --local-only --once
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import argparse
 import csv
 import html as html_std
 import json
+import math
 import os
 import random
 import re
@@ -169,6 +170,63 @@ LA_TZ = ZoneInfo(
 
 BASE_DIR = Path(__file__).resolve().parent
 NOTION_PAGE_ID = "3e0c18c6-fba4-8125-861c-fc246bbb0092"
+PARAMETERS_PAGE_ID = "3e4c18c6-fba4-8184-8f78-ee4b910d25b0"
+DEFAULT_INTERVAL_SECONDS = 60 * 60
+
+
+def parse_parameters(blocks):
+    values = {"循环间隔（分钟）": [], "日期": []}
+    for block in blocks:
+        if block.get("type") != "paragraph":
+            continue
+        text = "".join(part.get("plain_text", part.get("text", {}).get("content", ""))
+                       for part in block.get("paragraph", {}).get("rich_text", []))
+        for line in text.splitlines():
+            parts = re.split("[：:]", line, maxsplit=1)
+            if len(parts) == 2 and parts[0].strip() in values:
+                values[parts[0].strip()].append(parts[1].strip())
+    interval = DEFAULT_INTERVAL_SECONDS
+    if len(values["循环间隔（分钟）"]) == 1:
+        try:
+            seconds = float(values["循环间隔（分钟）"][0]) * 60
+            if math.isfinite(seconds) and 0 < seconds <= threading.TIMEOUT_MAX:
+                interval = seconds
+        except (ValueError, OverflowError):
+            pass
+    target = None  # 每轮运行时重新计算洛杉矶当天。
+    if len(values["日期"]) == 1:
+        value = values["日期"][0]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            try:
+                target = date.fromisoformat(value)
+            except ValueError:
+                pass
+    return interval, target
+
+
+def read_parameters():
+    reader = None
+    try:
+        reader = NotionWriter(datetime.now(LA_TZ).date())
+        blocks = []
+        cursor = None
+        while True:
+            params = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            result = reader.request("GET", "blocks/" + PARAMETERS_PAGE_ID + "/children", params=params)
+            blocks.extend(result["results"])
+            if not result.get("has_more"):
+                break
+            cursor = result.get("next_cursor")
+            if not cursor:
+                return DEFAULT_INTERVAL_SECONDS, None
+        return parse_parameters(blocks)
+    except Exception:
+        return DEFAULT_INTERVAL_SECONDS, None
+    finally:
+        if reader is not None:
+            reader.close()
 
 
 def date_matches(value: str, target: date) -> bool:
@@ -2426,29 +2484,31 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
 # 主程序
 # ============================================================
 
-def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = None) -> dict:
+def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = None, configured_date=None) -> dict:
     """抓取参数页面日期或洛杉矶当天的记录，写入日期子页面。"""
     if clear_stop:
         STOP_EVENT.clear()
 
     run_started_at = datetime.now(LA_TZ)
-    target_date = run_started_at.date()
+    target_date = configured_date or run_started_at.date()
+    explicit_date = configured_date is not None
     source_page_id = None
     date_fallback = False
     if date_page and date_page.strip():
         try:
             target_date = read_date_page(date_page)
             source_page_id = notion_page_id(date_page)
+            explicit_date = True
         except Exception as exc:
             # 参数读取失败不影响当天采集；不捕获用户中断或系统退出。
             target_date = datetime.now(LA_TZ).date()
             date_fallback = True
-            _log("警告", f"日期参数读取失败（{type(exc).__name__}），自动使用洛杉矶当天 {target_date}")
+            explicit_date = False
     started_perf = time.perf_counter()
 
     print("=" * 76)
     _log("开始", "ChineseInLA 招聘采集 | 指定日期刷新或发布 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
-    _log("日期", f"{target_date} | America/Los_Angeles | 来源={'Notion 页面标题' if source_page_id else '当天'}")
+    _log("日期", f"{target_date} | America/Los_Angeles")
     _log("配置", f"类型={JOB_TYPE_FILTER} | 跳过置顶={'是' if SKIP_PINNED else '否'}")
     _log(
         "配置",
@@ -2459,7 +2519,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
     _log("规则", "不读取历史、不去重、按网页顺序、每条成功后立即写入")
     print("=" * 76)
 
-    writer = None if local_only else NotionWriter(target_date, guard_midnight=source_page_id is None)
+    writer = None if local_only else NotionWriter(target_date, guard_midnight=not explicit_date)
     try:
         if writer is not None:
             writer.check_page()
@@ -2546,14 +2606,33 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
 
     return result
 
+def run_continuously(*, local_only=False, date_page=None, once=False):
+    STOP_EVENT.clear()
+    while not STOP_EVENT.is_set():
+        interval, target = read_parameters()
+        _log("参数", f"日期={target or '当天'} | 循环间隔={interval / 60:g} 分钟")
+        try:
+            run(clear_stop=False, local_only=local_only, date_page=date_page, configured_date=target)
+        except Exception:
+            _log("状态", "本轮未完成")
+            if once:
+                return 1
+        if once or STOP_EVENT.is_set():
+            return 0
+        _log("等待", f"本轮结束，{interval / 60:g} 分钟后重新读取参数并执行")
+        STOP_EVENT.wait(interval)
+    return 0
+
+
 def run_cli() -> None:
-    """执行一次采集后结束；无需桌面界面。"""
+    """默认持续运行，每轮读取参数页面。"""
     parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新或发布的招聘信息并追加到 Notion")
-    parser.add_argument("--local-only", action="store_true", help="仅保存 CSV，不写 Notion；传 --date-page 时仍读取参数页面")
-    parser.add_argument("--date-page", metavar="URL_OR_ID", help="读取指定 Notion 页面标题中的日期；不传则使用洛杉矶当天")
+    parser.add_argument("--local-only", action="store_true", help="仅保存 CSV，不写 Notion；仍读取参数页面")
+    parser.add_argument("--date-page", metavar="URL_OR_ID", help="读取指定 Notion 页面标题中的日期；不传则使用参数页面日期")
+    parser.add_argument("--once", action="store_true", help="读取参数后只执行一轮")
     args = parser.parse_args()
     try:
-        run(local_only=args.local_only, date_page=args.date_page)
+        raise SystemExit(run_continuously(local_only=args.local_only, date_page=args.date_page, once=args.once))
     except KeyboardInterrupt:
         STOP_EVENT.set()
         print("\n用户中止。")
