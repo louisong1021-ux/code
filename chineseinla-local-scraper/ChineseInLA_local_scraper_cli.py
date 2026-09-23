@@ -1,10 +1,10 @@
 """
-ChineseInLA 招聘采集：仅收录洛杉矶当天刷新的帖子。
+ChineseInLA 招聘采集：仅收录洛杉矶当天刷新或发布的帖子。
 
-依据桌面详情页 div.post_time 的“更新于”日期筛选，不用发布时间补值。
+依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是当天即收录。
 默认逐条追加至 Notion“招聘信息监控”，并保留本地 CSV；不删除旧内容。
 保持原有类型筛选、网页顺序和单次扫描行为，不以旧帖提前停止分页。
-重复运行可能重复追加。没有“更新于”或日期无效的帖子跳过。
+重复运行可能重复追加。两个日期均非当天或无效的帖子跳过。
 跨洛杉矶午夜停止 Notion 写入，避免日期混淆。
 
 依赖：pip install requests lxml tzdata
@@ -170,8 +170,8 @@ BASE_DIR = Path(__file__).resolve().parent
 NOTION_PAGE_ID = "3e0c18c6-fba4-8125-861c-fc246bbb0092"
 
 
-def refreshed_on(value: str, target: date) -> bool:
-    """只接受详情页明确的刷新日期；不以发布日期或相对时间补值。"""
+def date_matches(value: str, target: date) -> bool:
+    """只接受详情页明确的日历日期，不推断相对时间。"""
     match = re.match(r"^\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?=\D|$)", value or "")
     if not match:
         return False
@@ -179,6 +179,11 @@ def refreshed_on(value: str, target: date) -> bool:
         return date(*(int(part) for part in match.groups())) == target
     except ValueError:
         return False
+
+
+def matches_day(row: dict[str, str], target: date) -> bool:
+    return any(date_matches(row.get(field, ""), target)
+               for field in ("刷新时间", "发布时间"))
 
 
 def load_notion_token() -> str:
@@ -245,12 +250,12 @@ class NotionWriter:
     def write(self, row):
         if datetime.now(LA_TZ).date() != self.target:
             raise RuntimeError("已跨过洛杉矶午夜，停止写入；请重新运行以抓取新的一天")
-        if not refreshed_on(row.get("刷新时间", ""), self.target):
-            raise ValueError("拒绝写入非当天刷新的帖子")
+        if not matches_day(row, self.target):
+            raise ValueError("拒绝写入非当天刷新或发布的帖子")
         blocks = [recruitment_block(row)]
         if self.count == 0:
             blocks.insert(0, {"object": "block", "type": "heading_2", "heading_2": {
-                "rich_text": notion_text(f"当天刷新招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%H:%M:%S %Z}")}})
+                "rich_text": notion_text(f"当天刷新或发布招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%H:%M:%S %Z}")}})
         result = self.request("PATCH", "blocks/" + NOTION_PAGE_ID + "/children", json={"children": blocks})
         if len(result.get("results", [])) != len(blocks):
             raise RuntimeError("Notion 返回的写入数量不符，请检查页面后再重试")
@@ -1909,8 +1914,8 @@ def process_topic(
     url = item["详情URL"]
 
     publish_time, refresh_time = get_desktop_post_times(item.get("帖子ID", ""))
-    # 先验证刷新日期，旧帖不再请求手机详情页或解析正文。
-    if target_date is not None and not refreshed_on(refresh_time, target_date):
+    # 先验证刷新或发布日期，旧帖不再请求手机详情页或解析正文。
+    if target_date is not None and not matches_day({"刷新时间": refresh_time, "发布时间": publish_time}, target_date):
         return {**item, "发布时间": publish_time, "刷新时间": refresh_time}, ""
 
     page = fetch_html(
@@ -2281,10 +2286,10 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
                 )
                 continue
 
-            if not refreshed_on(row.get("刷新时间", ""), target_date):
+            if not matches_day(row, target_date):
                 stats["date_skipped"] = int(stats["date_skipped"]) + 1
                 page_skipped += 1
-                _log("跳过", f"ID {post_id} | 非当天刷新或无刷新日期 | {row.get('刷新时间') or '空'}")
+                _log("跳过", f"ID {post_id} | 刷新与发布均非当天或日期无效 | {row.get('刷新时间') or '空'}")
                 continue
 
             if not type_allowed(job_type):
@@ -2342,7 +2347,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
 # ============================================================
 
 def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
-    """抓取洛杉矶当天刷新记录，默认追加到招聘信息监控页面。"""
+    """抓取洛杉矶当天刷新或发布记录，默认追加到招聘信息监控页面。"""
     if clear_stop:
         STOP_EVENT.clear()
 
@@ -2350,8 +2355,8 @@ def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
     started_perf = time.perf_counter()
 
     print("=" * 76)
-    _log("开始", "ChineseInLA 招聘采集 | 当天刷新 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
-    _log("日期", f"{run_started_at.date()} | America/Los_Angeles | 无刷新日期不纳入")
+    _log("开始", "ChineseInLA 招聘采集 | 当天刷新或发布 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
+    _log("日期", f"{run_started_at.date()} | America/Los_Angeles | 刷新或发布任一日期为当天即纳入")
     _log("配置", f"类型={JOB_TYPE_FILTER} | 跳过置顶={'是' if SKIP_PINNED else '否'}")
     _log(
         "配置",
@@ -2388,7 +2393,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
     status_text = "已停止" if stop_reason == "user_stop" else "已完成"
 
     result = {
-        "mode": "today_refreshed_single_run",
+        "mode": "today_refreshed_or_published_single_run",
         "target_date": str(run_started_at.date()),
         "notion_page_id": None if local_only else NOTION_PAGE_ID,
         "notion_written": 0 if writer is None else writer.count,
@@ -2448,7 +2453,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
 
 def run_cli() -> None:
     """执行一次采集后结束；无需桌面界面。"""
-    parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新的招聘信息并追加到 Notion")
+    parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新或发布的招聘信息并追加到 Notion")
     parser.add_argument("--local-only", action="store_true", help="仅抓取并保存 CSV，不访问 Notion")
     args = parser.parse_args()
     try:
