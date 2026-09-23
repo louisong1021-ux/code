@@ -188,7 +188,15 @@ def parse_parameters(blocks):
     interval = DEFAULT_INTERVAL_SECONDS
     if len(values["循环间隔（分钟）"]) == 1:
         try:
-            seconds = float(values["循环间隔（分钟）"][0]) * 60
+            value = values["循环间隔（分钟）"][0]
+            bounds = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[-–~]\s*(\d+(?:\.\d+)?)\s*", value)
+            if bounds:
+                low, high = (float(part) * 60 for part in bounds.groups())
+                if not (0 < low <= high <= threading.TIMEOUT_MAX):
+                    raise ValueError("invalid interval range")
+                seconds = random.uniform(low, high)
+            else:
+                seconds = float(value) * 60
             if math.isfinite(seconds) and 0 < seconds <= threading.TIMEOUT_MAX:
                 interval = seconds
         except (ValueError, OverflowError):

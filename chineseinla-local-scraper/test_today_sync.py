@@ -28,6 +28,13 @@ class TodaySyncTests(unittest.TestCase):
             self.assertEqual(app.read_parameters(), (3600, None))
             output.assert_not_called()
 
+    def test_random_interval_range(self):
+        with patch.object(app.random, "uniform", return_value=240) as draw:
+            self.assertEqual(app.parse_parameters(self.parameter_blocks("循环间隔（分钟）：3-5", "日期：")), (240, None))
+            draw.assert_called_once_with(180, 300)
+        for value in ("5-3", "0-5", "3-bad"):
+            self.assertEqual(app.parse_parameters(self.parameter_blocks("循环间隔（分钟）：" + value)), (3600, None))
+
     def test_loop_reads_changed_parameters_and_survives_failure(self):
         app.STOP_EVENT.clear()
         waits = []
