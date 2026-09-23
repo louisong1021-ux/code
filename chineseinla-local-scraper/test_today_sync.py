@@ -8,6 +8,33 @@ import ChineseInLA_local_scraper_cli as app
 
 
 class TodaySyncTests(unittest.TestCase):
+    def test_pinned_and_normal_posts_write_to_separate_pages(self):
+        today = app.datetime.now(app.LA_TZ).date()
+        with patch.object(app, "load_notion_token", return_value="dummy"):
+            writer = app.NotionWriter(today)
+        writer.pinned_page_id = "pinned"
+        writer.daily_page_id = "daily"
+        writer.request = Mock(side_effect=[{"results": [{}, {}]}, {"results": [{}, {}]}, {"results": [{}]}])
+        row = {"标题": "招聘", "发布时间": str(today), "详情URL": "https://example.com/job"}
+        writer.write({**row, "置顶": "是"})
+        writer.write(row)
+        writer.write({**row, "置顶": "是"})
+        self.assertEqual([c.args[1] for c in writer.request.call_args_list],
+                         ["blocks/pinned/children", "blocks/daily/children", "blocks/pinned/children"])
+        self.assertEqual(writer.count, 3)
+        writer.close()
+
+    def test_pinned_page_created_with_correct_title(self):
+        with patch.object(app, "load_notion_token", return_value="dummy"):
+            writer = app.NotionWriter(date(2026, 9, 23))
+        writer.request = Mock(side_effect=[{"results": [], "has_more": False}, {"id": "pinned"}])
+        self.assertEqual(writer.ensure_pinned_page(), "pinned")
+        self.assertEqual(writer.request.call_args.kwargs["json"]["properties"]["title"]["title"][0]["text"]["content"], "置顶")
+        self.assertIsNone(writer.daily_page_id)
+        self.assertEqual(writer.ensure_pinned_page(), "pinned")
+        self.assertEqual(writer.request.call_count, 2)
+        writer.close()
+
     def test_old_normal_page_stops_without_following_page(self):
         today = date(2026, 9, 23)
         pinned = {"帖子ID": "1", "标题": "Pinned", "置顶": "是", "刷新时间": "2026/09/23"}

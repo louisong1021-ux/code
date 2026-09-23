@@ -360,6 +360,8 @@ class NotionWriter:
         self.started_date = datetime.now(LA_TZ).date()
         self.count = 0
         self.daily_page_id = None
+        self.pinned_page_id = None
+        self.started_pages = set()
         self.session = requests.Session()
         self.session.headers.update({"Authorization": "Bearer " + load_notion_token(),
                                      "Notion-Version": "2026-03-11", "Content-Type": "application/json"})
@@ -378,9 +380,16 @@ class NotionWriter:
             raise RuntimeError("目标页面标题不匹配，拒绝写入")
 
     def ensure_daily_page(self):
-        if self.daily_page_id:
-            return self.daily_page_id
-        title = self.target.isoformat()
+        if not self.daily_page_id:
+            self.daily_page_id = self.ensure_child_page(self.target.isoformat())
+        return self.daily_page_id
+
+    def ensure_pinned_page(self):
+        if not self.pinned_page_id:
+            self.pinned_page_id = self.ensure_child_page("置顶")
+        return self.pinned_page_id
+
+    def ensure_child_page(self, title):
         matches = []
         cursor = None
         while True:
@@ -396,33 +405,35 @@ class NotionWriter:
                 break
             cursor = result.get("next_cursor")
             if not cursor:
-                raise RuntimeError("Notion 分页缺少游标，停止以避免重复创建日期页面")
+                raise RuntimeError("Notion 分页缺少游标，停止以避免重复创建子页面")
         if len(matches) > 1:
-            raise RuntimeError(f"存在多个同名日期页面 {title}，请先确认保留哪一个")
+            raise RuntimeError(f"存在多个同名子页面 {title}，请先确认保留哪一个")
         if matches:
-            self.daily_page_id = matches[0]
+            page_id = matches[0]
         else:
             page = self.request("POST", "pages", json={
                 "parent": {"type": "page_id", "page_id": NOTION_PAGE_ID},
                 "properties": {"title": {"type": "title", "title": notion_text(title)}}})
-            self.daily_page_id = page["id"]
-        _log("Notion", f"日期页面：{title} | {self.daily_page_id}")
-        return self.daily_page_id
+            page_id = page["id"]
+        _log("Notion", f"子页面：{title} | {page_id}")
+        return page_id
 
     def write(self, row):
         if self.guard_midnight and datetime.now(LA_TZ).date() != self.started_date:
             raise RuntimeError("已跨过洛杉矶午夜，停止写入；请重新运行以抓取新的一天")
         if not matches_day(row, self.target):
             raise ValueError("拒绝写入非目标日期刷新或发布的帖子")
+        is_pinned = clean(row.get("置顶")) == "是"
+        page_id = self.ensure_pinned_page() if is_pinned else self.ensure_daily_page()
         blocks = [recruitment_block(row)]
-        if self.count == 0:
+        if page_id not in self.started_pages:
             blocks.insert(0, {"object": "block", "type": "heading_2", "heading_2": {
                 "rich_text": notion_text(f"刷新或发布招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%Y-%m-%d %H:%M:%S %Z}")}})
-        page_id = self.ensure_daily_page()
         result = self.request("PATCH", "blocks/" + page_id + "/children", json={"children": blocks})
         if len(result.get("results", [])) != len(blocks):
             raise RuntimeError("Notion 返回的写入数量不符，请检查页面后再重试")
         self.count += 1
+        self.started_pages.add(page_id)
 
     def close(self):
         self.session.close()
