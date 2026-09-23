@@ -400,10 +400,18 @@ def read_all_topic_rows(html, current_url):
     raw_rows = []
 
     for index, row in enumerate(elements):
+        # 普通分页帖子直接属于 forum_line；竞价广告位于 bid_box，置顶带 sticky。
+        if row.parent is None or "forum_line" not in row.parent.get("class", []):
+            continue
+        if row.find_parent(class_="bid_box") or row.select_one(".sticky, .bid"):
+            continue
         topic_link = row.select_one('a.title[href*="page_viewtopic"]')
 
         if topic_link is None:
             topic_link = row.select_one('a[href*="page_viewtopic"]')
+
+        if topic_link is None:
+            continue  # 页脚等没有帖子链接的占位容器。
 
         title = ""
         url = ""
@@ -514,97 +522,6 @@ def parse_all_rows(raw_rows, run_date, target_dates):
 # ============================================================
 
 
-def score_window(
-    window,
-    page_number,
-    previous_last_minutes,
-    entered_dated_zone,
-):
-    score = 0
-
-    unknown_count = sum(1 for row in window if row["kind"] == "unknown")
-    score -= unknown_count * 5000
-
-    urls = [row["url"] for row in window if row["url"]]
-    if len(urls) != len(set(urls)):
-        score -= 5000
-
-    previous_phase = -1
-
-    for row in window:
-        phase = row.get("phase")
-
-        if phase is None:
-            continue
-
-        if previous_phase >= 0 and phase < previous_phase:
-            score -= 15000
-
-        previous_phase = max(previous_phase, phase)
-
-    if entered_dated_zone:
-        today_after_dated = sum(1 for row in window if row["kind"] == "day0")
-        score -= today_after_dated * 20000
-
-    today_rows = [row for row in window if row["kind"] == "day0"]
-    previous_minutes = None
-
-    for row in today_rows:
-        current_minutes = row["minutes"]
-
-        if previous_minutes is not None:
-            if current_minutes <= previous_minutes:
-                score += 100
-            else:
-                score -= 8000
-
-        previous_minutes = current_minutes
-
-    dated_rows = [
-        row
-        for row in window
-        if row["kind"] in {"day1", "day2", "older"}
-    ]
-
-    previous_date = None
-
-    for row in dated_rows:
-        current_date = row["date"]
-
-        if previous_date is not None and current_date is not None:
-            if current_date <= previous_date:
-                score += 30
-            else:
-                score -= 1000
-
-        if current_date is not None:
-            previous_date = current_date
-
-    if page_number == 1:
-        score += len(today_rows) * 1000
-    else:
-        score += len(today_rows) * 500
-
-    if previous_last_minutes is not None and today_rows:
-        first_minutes = today_rows[0]["minutes"]
-
-        if first_minutes <= previous_last_minutes:
-            score += 1500
-            gap = previous_last_minutes - first_minutes
-            score += max(0, 300 - gap)
-        else:
-            score -= 12000
-
-    valid_count = sum(
-        1
-        for row in window
-        if row["kind"] in {"day0", "day1", "day2", "older"}
-    )
-    score += valid_count * 50
-
-    return score
-
-
 def find_main_window(
     parsed_rows,
     page_number,
@@ -612,96 +529,25 @@ def find_main_window(
     entered_dated_zone,
     previous_window_start,
 ):
-    if len(parsed_rows) < PAGE_STEP:
-        raise RuntimeError(
-            f"页面只有 {len(parsed_rows)} 个帖子容器，"
-            f"少于正常分页的 {PAGE_STEP} 条。"
-        )
-
-    candidates = []
-
-    for start in range(0, len(parsed_rows) - PAGE_STEP + 1):
-        window = parsed_rows[start:start + PAGE_STEP]
-        score = score_window(
-            window,
-            page_number,
-            previous_last_minutes,
-            entered_dated_zone,
-        )
-
-        candidates.append(
-            {
-                "start": start,
-                "end": start + PAGE_STEP - 1,
-                "score": score,
-                "window": window,
-            }
-        )
-
-    candidates.sort(key=lambda item: item["score"], reverse=True)
-    best = candidates[0]
-
-    debug_message()
-    debug_message("自动识别分页主列表：")
-    debug_message(f"  DOM位置：{best['start'] + 1}～{best['end'] + 1}")
-    debug_message(f"  匹配分数：{best['score']}")
-
-    if len(candidates) >= 2:
-        second = candidates[1]
-        debug_message(
-            f"  第二候选：{second['start'] + 1}～{second['end'] + 1}"
-            f" / 分数 {second['score']}"
-        )
-
-        score_gap = best["score"] - second["score"]
-
-        if score_gap < 100:
-            previous_match = None
-
-            if previous_window_start is not None:
-                for candidate in candidates:
-                    candidate_gap = best["score"] - candidate["score"]
-
-                    if candidate_gap >= 100:
-                        break
-
-                    if candidate["start"] == previous_window_start:
-                        previous_match = candidate
-                        break
-
-            if previous_match is not None:
-                best = previous_match
-                debug_message("  ✓ 候选分数接近")
-                debug_message(
-                    "  ✓ 采用上一页主列表位置："
-                    f"{best['start'] + 1}～{best['end'] + 1}"
-                )
-            else:
-                raise RuntimeError(
-                    "主列表候选区域分数过于接近，"
-                    "且无法通过上一页位置安全判断真正分页列表。"
-                )
-
-    window = best["window"]
-    unknown_rows = [row for row in window if row["kind"] == "unknown"]
-
-    if unknown_rows:
-        debug_message()
-        debug_message("无法解析的主列表帖子：")
-
-        for row in unknown_rows:
-            debug_message("  -", row["title"])
-            debug_message("    ", row["text"])
-
-        raise RuntimeError("真正分页列表中存在无法解析帖子。")
-
-    return window, best["start"]
-
-
-# ============================================================
-# 解析一页
-# ============================================================
-
+    # read_all_topic_rows 已按 DOM 结构排除广告、置顶和空占位。
+    # 不再用日期评分猜测窗口，也不依赖上一页的 DOM 位置。
+    if len(parsed_rows) != PAGE_STEP:
+        raise RuntimeError(f"第 {page_number} 页普通帖子数量异常：{len(parsed_rows)}，预期 {PAGE_STEP}；禁止更新 Notion。")
+    if any(row["kind"] == "unknown" for row in parsed_rows):
+        raise RuntimeError("普通分页列表中存在无法解析的帖子；禁止更新 Notion。")
+    urls = [row["url"] for row in parsed_rows]
+    if len(set(urls)) != len(urls):
+        raise RuntimeError("普通分页列表存在重复帖子；禁止更新 Notion。")
+    keys = [(row["date"], row["minutes"]) for row in parsed_rows]
+    if any(right > left for left, right in zip(keys, keys[1:])):
+        raise RuntimeError("普通帖子日期顺序异常；禁止更新 Notion。")
+    today_rows = [row for row in parsed_rows if row["kind"] == "day0"]
+    if entered_dated_zone and today_rows:
+        raise RuntimeError("已进入历史日期后再次出现今天帖子；禁止更新 Notion。")
+    if previous_last_minutes is not None and today_rows and today_rows[0]["minutes"] > previous_last_minutes:
+        raise RuntimeError("跨页帖子时间顺序异常；禁止更新 Notion。")
+    LOGGER.info("第 %s 页结构识别成功：%s 条普通帖子", page_number, len(parsed_rows))
+    return parsed_rows, parsed_rows[0]["dom_index"]
 
 def extract_posts_from_html(
     html,
