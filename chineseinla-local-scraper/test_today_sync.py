@@ -59,16 +59,51 @@ class TodaySyncTests(unittest.TestCase):
         with patch.object(app, "load_notion_token", return_value="dummy"):
             writer = app.NotionWriter(today)
         writer.request = Mock(return_value={"results": [{"id": "heading"}, {"id": "post"}]})
+        writer.daily_page_id = "daily-page"
         row = {"标题": "测试招聘", "刷新时间": "", "发布时间": str(today), "正文": "正文" * 2000,
                "详情URL": "https://example.com/job"}
         writer.write(row)
         args, kwargs = writer.request.call_args
-        self.assertEqual(args, ("PATCH", "blocks/" + app.NOTION_PAGE_ID + "/children"))
+        self.assertEqual(args, ("PATCH", "blocks/daily-page/children"))
         self.assertEqual(writer.count, 1)
         children = kwargs["json"]["children"][1]["toggle"]["children"]
         self.assertGreater(len(children), 2)
         with self.assertRaises(ValueError):
             writer.write({**row, "刷新时间": "2001/01/01", "发布时间": "2001/01/01"})
+        self.assertEqual(writer.request.call_count, 1)
+        writer.close()
+
+    def test_create_date_page_under_monitor(self):
+        with patch.object(app, "load_notion_token", return_value="dummy"):
+            writer = app.NotionWriter(date(2026, 9, 23))
+        writer.request = Mock(side_effect=[{"results": [], "has_more": False}, {"id": "new-day"}])
+        self.assertEqual(writer.ensure_daily_page(), "new-day")
+        args, kwargs = writer.request.call_args
+        self.assertEqual(args, ("POST", "pages"))
+        self.assertEqual(kwargs["json"]["parent"]["page_id"], app.NOTION_PAGE_ID)
+        self.assertEqual(kwargs["json"]["properties"]["title"]["title"][0]["text"]["content"], "2026-09-23")
+        self.assertEqual(writer.ensure_daily_page(), "new-day")
+        self.assertEqual(writer.request.call_count, 2)
+        writer.close()
+
+    def test_reuse_date_page_on_later_pagination(self):
+        with patch.object(app, "load_notion_token", return_value="dummy"):
+            writer = app.NotionWriter(date(2026, 9, 23))
+        writer.request = Mock(side_effect=[
+            {"results": [], "has_more": True, "next_cursor": "next"},
+            {"results": [{"id": "existing", "type": "child_page", "child_page": {"title": "2026-09-23"}}], "has_more": False}])
+        self.assertEqual(writer.ensure_daily_page(), "existing")
+        self.assertEqual(writer.request.call_args.kwargs["params"]["start_cursor"], "next")
+        self.assertTrue(all(call.args[0] == "GET" for call in writer.request.call_args_list))
+        writer.close()
+
+    def test_duplicate_date_pages_abort(self):
+        with patch.object(app, "load_notion_token", return_value="dummy"):
+            writer = app.NotionWriter(date(2026, 9, 23))
+        writer.request = Mock(return_value={"results": [
+            {"id": str(i), "type": "child_page", "child_page": {"title": "2026-09-23"}} for i in range(2)]})
+        with self.assertRaises(RuntimeError):
+            writer.ensure_daily_page()
         self.assertEqual(writer.request.call_count, 1)
         writer.close()
 

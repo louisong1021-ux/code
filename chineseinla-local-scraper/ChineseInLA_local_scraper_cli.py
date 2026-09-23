@@ -2,7 +2,7 @@
 ChineseInLA 招聘采集：仅收录洛杉矶当天刷新或发布的帖子。
 
 依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是当天即收录。
-默认逐条追加至 Notion“招聘信息监控”，并保留本地 CSV；不删除旧内容。
+默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，逐条追加；保留本地 CSV 和旧内容。
 保持原有类型筛选、网页顺序和单次扫描行为，不以旧帖提前停止分页。
 重复运行可能重复追加。两个日期均非当天或无效的帖子跳过。
 跨洛杉矶午夜停止 Notion 写入，避免日期混淆。
@@ -228,6 +228,7 @@ class NotionWriter:
     def __init__(self, target: date):
         self.target = target
         self.count = 0
+        self.daily_page_id = None
         self.session = requests.Session()
         self.session.headers.update({"Authorization": "Bearer " + load_notion_token(),
                                      "Notion-Version": "2026-03-11", "Content-Type": "application/json"})
@@ -247,6 +248,38 @@ class NotionWriter:
         if title != "招聘信息监控":
             raise RuntimeError("目标页面标题不匹配，拒绝写入")
 
+    def ensure_daily_page(self):
+        if self.daily_page_id:
+            return self.daily_page_id
+        title = self.target.isoformat()
+        matches = []
+        cursor = None
+        while True:
+            params = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            result = self.request("GET", "blocks/" + NOTION_PAGE_ID + "/children", params=params)
+            matches.extend(block["id"] for block in result.get("results", [])
+                           if block.get("type") == "child_page"
+                           and block.get("child_page", {}).get("title") == title
+                           and not block.get("archived") and not block.get("in_trash"))
+            if not result.get("has_more"):
+                break
+            cursor = result.get("next_cursor")
+            if not cursor:
+                raise RuntimeError("Notion 分页缺少游标，停止以避免重复创建日期页面")
+        if len(matches) > 1:
+            raise RuntimeError(f"存在多个同名日期页面 {title}，请先确认保留哪一个")
+        if matches:
+            self.daily_page_id = matches[0]
+        else:
+            page = self.request("POST", "pages", json={
+                "parent": {"type": "page_id", "page_id": NOTION_PAGE_ID},
+                "properties": {"title": {"type": "title", "title": notion_text(title)}}})
+            self.daily_page_id = page["id"]
+        _log("Notion", f"日期页面：{title} | {self.daily_page_id}")
+        return self.daily_page_id
+
     def write(self, row):
         if datetime.now(LA_TZ).date() != self.target:
             raise RuntimeError("已跨过洛杉矶午夜，停止写入；请重新运行以抓取新的一天")
@@ -256,7 +289,8 @@ class NotionWriter:
         if self.count == 0:
             blocks.insert(0, {"object": "block", "type": "heading_2", "heading_2": {
                 "rich_text": notion_text(f"当天刷新或发布招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%H:%M:%S %Z}")}})
-        result = self.request("PATCH", "blocks/" + NOTION_PAGE_ID + "/children", json={"children": blocks})
+        page_id = self.ensure_daily_page()
+        result = self.request("PATCH", "blocks/" + page_id + "/children", json={"children": blocks})
         if len(result.get("results", [])) != len(blocks):
             raise RuntimeError("Notion 返回的写入数量不符，请检查页面后再重试")
         self.count += 1
@@ -2396,6 +2430,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
         "mode": "today_refreshed_or_published_single_run",
         "target_date": str(run_started_at.date()),
         "notion_page_id": None if local_only else NOTION_PAGE_ID,
+        "notion_daily_page_id": None if writer is None else writer.daily_page_id,
         "notion_written": 0 if writer is None else writer.count,
         "run_started_at": run_started_at.isoformat(timespec="seconds"),
         "run_finished_at": run_finished_at.isoformat(timespec="seconds"),
