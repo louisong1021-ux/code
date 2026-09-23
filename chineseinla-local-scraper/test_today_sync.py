@@ -16,9 +16,9 @@ class TodaySyncTests(unittest.TestCase):
         writer.daily_page_id = "daily"
         writer.request = Mock(side_effect=[{"results": [{}, {}]}, {"results": [{}, {}]}, {"results": [{}]}])
         row = {"标题": "招聘", "发布时间": str(today), "详情URL": "https://example.com/job"}
-        writer.write({**row, "置顶": "是"})
+        writer.write({**row, "置顶": "是", "发布时间": "2000/01/01"})
         writer.write(row)
-        writer.write({**row, "置顶": "是"})
+        writer.write({**row, "置顶": "是", "发布时间": "2000/01/01"})
         self.assertEqual([c.args[1] for c in writer.request.call_args_list],
                          ["blocks/pinned/children", "blocks/daily/children", "blocks/pinned/children"])
         self.assertEqual(writer.count, 3)
@@ -37,13 +37,13 @@ class TodaySyncTests(unittest.TestCase):
 
     def test_old_normal_page_stops_without_following_page(self):
         today = date(2026, 9, 23)
-        pinned = {"帖子ID": "1", "标题": "Pinned", "置顶": "是", "刷新时间": "2026/09/23"}
+        pinned = {"帖子ID": "1", "标题": "Pinned", "置顶": "是", "刷新时间": "2020/01/01"}
         old = {"帖子ID": "2", "标题": "Old", "发布时间": "2026/09/22"}
         app.STOP_EVENT.clear()
         with patch.object(app, "fetch_html", return_value="<html></html>") as fetch, \
                 patch.object(app, "extract_topic_links", return_value=[pinned, old]), \
-                patch.object(app, "process_topic", side_effect=[(pinned, "招聘"), (old, "招聘")]), \
-                patch.object(app, "type_allowed", return_value=True), \
+                patch.object(app, "process_topic", side_effect=[(pinned, "求职"), (old, "招聘")]), \
+                patch.object(app, "type_allowed", return_value=False), \
                 patch.object(app, "ensure_csv_header"), patch.object(app, "append_csv_row"), \
                 patch.object(app, "_log"), patch.object(app, "_log_captured_row"):
             rows, stats = app.crawl_live(today)

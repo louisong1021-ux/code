@@ -421,14 +421,14 @@ class NotionWriter:
     def write(self, row):
         if self.guard_midnight and datetime.now(LA_TZ).date() != self.started_date:
             raise RuntimeError("已跨过洛杉矶午夜，停止写入；请重新运行以抓取新的一天")
-        if not matches_day(row, self.target):
-            raise ValueError("拒绝写入非目标日期刷新或发布的帖子")
         is_pinned = clean(row.get("置顶")) == "是"
+        if not is_pinned and not matches_day(row, self.target):
+            raise ValueError("拒绝写入非目标日期刷新或发布的帖子")
         page_id = self.ensure_pinned_page() if is_pinned else self.ensure_daily_page()
         blocks = [recruitment_block(row)]
         if page_id not in self.started_pages:
             blocks.insert(0, {"object": "block", "type": "heading_2", "heading_2": {
-                "rich_text": notion_text(f"刷新或发布招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%Y-%m-%d %H:%M:%S %Z}")}})
+                "rich_text": notion_text(f"{'全部置顶帖子' if is_pinned else f'刷新或发布招聘 · {self.target}'} · 采集于 {datetime.now(LA_TZ):%Y-%m-%d %H:%M:%S %Z}")}})
         result = self.request("PATCH", "blocks/" + page_id + "/children", json={"children": blocks})
         if len(result.get("results", [])) != len(blocks):
             raise RuntimeError("Notion 返回的写入数量不符，请检查页面后再重试")
@@ -2088,8 +2088,8 @@ def process_topic(
     url = item["详情URL"]
 
     publish_time, refresh_time = get_desktop_post_times(item.get("帖子ID", ""))
-    # 先验证刷新或发布日期，旧帖不再请求手机详情页或解析正文。
-    if target_date is not None and not matches_day({"刷新时间": refresh_time, "发布时间": publish_time}, target_date):
+    # 普通帖先验证日期；置顶帖始终读取正文，不限制日期。
+    if clean(item.get("置顶")) != "是" and target_date is not None and not matches_day({"刷新时间": refresh_time, "发布时间": publish_time}, target_date):
         return {**item, "发布时间": publish_time, "刷新时间": refresh_time}, ""
 
     page = fetch_html(
@@ -2471,13 +2471,14 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
             if not item_is_pinned and not older_than_target(row, target_date):
                 all_normal_older = False
 
-            if not matches_day(row, target_date):
+            is_pinned = clean(row.get("置顶")) == "是" or item_is_pinned
+            if not is_pinned and not matches_day(row, target_date):
                 stats["date_skipped"] = int(stats["date_skipped"]) + 1
                 page_skipped += 1
                 _log("跳过", f"ID {post_id} | 刷新与发布均非目标日期或日期无效 | {row.get('刷新时间') or '空'}")
                 continue
 
-            if not type_allowed(job_type):
+            if not is_pinned and not type_allowed(job_type):
                 stats["type_skipped"] = int(stats["type_skipped"]) + 1
                 page_skipped += 1
                 _log(
