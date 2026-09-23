@@ -1,28 +1,19 @@
 """
-ChineseInLA 手机端招聘抓取【纯本地单次采集版】
+ChineseInLA 招聘采集：仅收录洛杉矶当天刷新的帖子。
 
-功能
-----
-1. 直接实时抓取 https://m.chineseinla.com 手机端招聘板块。
-2. 不连接、不读取、不写入 Notion。
-3. 不读取历史索引，不按帖子ID、标题、电话、Hash 等做帖子去重。
-4. 每次运行都从论坛第一页开始，严格按网页列表出现顺序处理帖子。
-5. 不设置抓取数量目标，也不设置最大扫描页数；从第一页一直向后抓，直到论坛分页结束。
-6. 每抓取并解析成功一条符合类型的帖子，就立即追加写入本地 CSV。
-7. 每次启动只执行一轮；扫描到底、按 Ctrl+C 中止或发生终止条件后即结束，不循环等待。
-8. 再次手动运行时仍追加到同一个 CSV；因为不去重，所以重复出现的帖子会再次写入。
-9. 解析：帖子ID、标题、公司名、地址、联系人、电话、邮箱、发布时间、刷新时间、正文、详情URL；不抓微信。
-10. 正文只读取手机端 div.topic_text；电话和邮箱只读取各自标签文字。
-11. 发布时间和刷新时间直接从桌面版详情页 div.post_time 获取；没有“更新于”时刷新时间留空。
-12. 无桌面界面；运行脚本后直接开始单次采集，日志输出到终端。
+依据桌面详情页 div.post_time 的“更新于”日期筛选，不用发布时间补值。
+默认逐条追加至 Notion“招聘信息监控”，并保留本地 CSV；不删除旧内容。
+保持原有类型筛选、网页顺序和单次扫描行为，不以旧帖提前停止分页。
+重复运行可能重复追加。没有“更新于”或日期无效的帖子跳过。
+跨洛杉矶午夜停止 Notion 写入，避免日期混淆。
 
-依赖
-----
-pip install lxml requests
+依赖：pip install requests lxml tzdata
+凭据：同目录 notion_token.txt 或 NOTION_TOKEN 环境变量，勿提交到 Git。
+仅本地测试：python ChineseInLA_local_scraper_cli.py --local-only
 """
-
 from __future__ import annotations
 
+import argparse
 import csv
 import html as html_std
 import json
@@ -31,7 +22,7 @@ import random
 import re
 import time
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.error import HTTPError, URLError
@@ -176,6 +167,98 @@ LA_TZ = ZoneInfo(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+NOTION_PAGE_ID = "3e0c18c6-fba4-8125-861c-fc246bbb0092"
+
+
+def refreshed_on(value: str, target: date) -> bool:
+    """只接受详情页明确的刷新日期；不以发布日期或相对时间补值。"""
+    match = re.match(r"^\s*(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?=\D|$)", value or "")
+    if not match:
+        return False
+    try:
+        return date(*(int(part) for part in match.groups())) == target
+    except ValueError:
+        return False
+
+
+def load_notion_token() -> str:
+    path = BASE_DIR / "notion_token.txt"
+    token = os.environ.get("NOTION_TOKEN", "").strip()
+    if path.exists():
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        token = next((line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")), "")
+        if token.startswith(("NOTION_TOKEN=", "NOTION_ACCESS_TOKEN=")):
+            token = token.split("=", 1)[1].strip()
+    token = token.strip('"').strip("'")
+    if not token:
+        raise RuntimeError("请设置 NOTION_TOKEN 环境变量，或在脚本目录放置 notion_token.txt")
+    return token
+
+
+def notion_text(text: str) -> list[dict]:
+    # Notion 每段 rich_text 的 text.content 最多 2000 字符。
+    return [{"type": "text", "text": {"content": text[i:i + 1800]}}
+            for i in range(0, len(text), 1800)]
+
+
+def recruitment_block(row: dict[str, str]) -> dict:
+    fields = [f"{key}：{row.get(key) or '未采集'}" for key in OUTPUT_FIELDS
+              if key not in {"标题", "正文", "详情URL"}]
+    text = "\n".join(fields) + "\n\n正文：\n" + (row.get("正文") or "未采集")
+    children = [{"object": "block", "type": "paragraph",
+                 "paragraph": {"rich_text": notion_text(text[i:i + 1800])}}
+                for i in range(0, len(text), 1800)]
+    # 单次 block children 最多 100，异常超长内容明确报错，不静默截断。
+    if len(children) > 99:
+        raise ValueError("帖子正文超出 Notion 单条容量，停止写入以避免截断")
+    url = row.get("详情URL", "")
+    children.append({"object": "block", "type": "paragraph", "paragraph": {
+        "rich_text": [{"type": "text", "text": {"content": "查看原帖", "link": {"url": url}}}]}})
+    return {"object": "block", "type": "toggle", "toggle": {
+        "rich_text": notion_text(row.get("标题", "招聘信息")[:1800]), "children": children}}
+
+
+class NotionWriter:
+    """追加本轮结果，不删除页面现有内容。写入不自动重试以免重复追加。"""
+    def __init__(self, target: date):
+        self.target = target
+        self.count = 0
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": "Bearer " + load_notion_token(),
+                                     "Notion-Version": "2026-03-11", "Content-Type": "application/json"})
+
+    def request(self, method, path, **kwargs):
+        response = self.session.request(method, "https://api.notion.com/v1/" + path,
+                                        timeout=45, **kwargs)
+        if not response.ok:
+            raise RuntimeError(f"Notion 请求失败 HTTP {response.status_code}；请检查页面授权及日志")
+        return response.json()
+
+    def check_page(self):
+        page = self.request("GET", "pages/" + NOTION_PAGE_ID)
+        title = "".join(t.get("plain_text", t.get("text", {}).get("content", ""))
+                        for prop in page.get("properties", {}).values()
+                        if prop.get("type") == "title" for t in prop.get("title", []))
+        if title != "招聘信息监控":
+            raise RuntimeError("目标页面标题不匹配，拒绝写入")
+
+    def write(self, row):
+        if datetime.now(LA_TZ).date() != self.target:
+            raise RuntimeError("已跨过洛杉矶午夜，停止写入；请重新运行以抓取新的一天")
+        if not refreshed_on(row.get("刷新时间", ""), self.target):
+            raise ValueError("拒绝写入非当天刷新的帖子")
+        blocks = [recruitment_block(row)]
+        if self.count == 0:
+            blocks.insert(0, {"object": "block", "type": "heading_2", "heading_2": {
+                "rich_text": notion_text(f"当天刷新招聘 · {self.target} · 采集于 {datetime.now(LA_TZ):%H:%M:%S %Z}")}})
+        result = self.request("PATCH", "blocks/" + NOTION_PAGE_ID + "/children", json={"children": blocks})
+        if len(result.get("results", [])) != len(blocks):
+            raise RuntimeError("Notion 返回的写入数量不符，请检查页面后再重试")
+        self.count += 1
+
+    def close(self):
+        self.session.close()
+
 OUTPUT_CSV = (
     BASE_DIR
     / "ChineseInLA_local_posts.csv"
@@ -1818,11 +1901,17 @@ def type_allowed(
 
 def process_topic(
     item: dict[str, str],
+    target_date=None,
 ) -> tuple[
     dict[str, str],
     str,
 ]:
     url = item["详情URL"]
+
+    publish_time, refresh_time = get_desktop_post_times(item.get("帖子ID", ""))
+    # 先验证刷新日期，旧帖不再请求手机详情页或解析正文。
+    if target_date is not None and not refreshed_on(refresh_time, target_date):
+        return {**item, "发布时间": publish_time, "刷新时间": refresh_time}, ""
 
     page = fetch_html(
         url
@@ -1863,12 +1952,6 @@ def process_topic(
     # 发布时间 / 刷新时间统一直接读取桌面版详情页 div.post_time。
     # 注意：只发布过一次、从未重新发布/刷新过的帖子没有“更新于”，
     # 此时 refresh_time 保持空字符串，不使用发布时间或其他来源补值。
-    publish_time, refresh_time = get_desktop_post_times(
-        item.get(
-            "帖子ID",
-            "",
-        )
-    )
 
     phone, email = extract_contacts(
         lines,
@@ -2057,7 +2140,7 @@ def _log_captured_row(
     print(f"    详情URL  ：{_field_log_value(row.get('详情URL'))}")
 
 
-def crawl_live() -> tuple[list[dict[str, str]], dict[str, object]]:
+def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dict[str, object]]:
     """
     每次运行从论坛第一页开始，按网页列表实际顺序抓取。
 
@@ -2069,6 +2152,7 @@ def crawl_live() -> tuple[list[dict[str, str]], dict[str, object]]:
     - 跳过/失败：单独标记，便于搜索；
     - 结束：由 run() 输出统一运行报告。
     """
+    target_date = target_date or datetime.now(LA_TZ).date()
     rows: list[dict[str, str]] = []
 
     stats: dict[str, object] = {
@@ -2076,6 +2160,7 @@ def crawl_live() -> tuple[list[dict[str, str]], dict[str, object]]:
         "detail_failed": 0,
         "list_failed": 0,
         "type_skipped": 0,
+        "date_skipped": 0,
         "invalid": 0,
         "pinned_found": 0,
         "normal_found": 0,
@@ -2178,7 +2263,7 @@ def crawl_live() -> tuple[list[dict[str, str]], dict[str, object]]:
             item_is_pinned = clean(item.get("置顶")) == "是"
 
             try:
-                row, job_type = process_topic(item)
+                row, job_type = process_topic(item, target_date=target_date)
             except (
                 HTTPError,
                 URLError,
@@ -2194,6 +2279,12 @@ def crawl_live() -> tuple[list[dict[str, str]], dict[str, object]]:
                     "失败",
                     f"ID {post_id} | {_short_text(title)} | {type(exc).__name__}: {exc}",
                 )
+                continue
+
+            if not refreshed_on(row.get("刷新时间", ""), target_date):
+                stats["date_skipped"] = int(stats["date_skipped"]) + 1
+                page_skipped += 1
+                _log("跳过", f"ID {post_id} | 非当天刷新或无刷新日期 | {row.get('刷新时间') or '空'}")
                 continue
 
             if not type_allowed(job_type):
@@ -2214,7 +2305,9 @@ def crawl_live() -> tuple[list[dict[str, str]], dict[str, object]]:
                 row["置顶"] = ""
                 stats["normal_found"] = int(stats["normal_found"]) + 1
 
-            # 不去重：每抓到一条，立即按网页顺序追加到本地 CSV。
+            # 先确认 Notion 写入成功，再计入本地成功记录；失败时停止，保留已写入结果。
+            if writer is not None:
+                writer.write(row)
             append_csv_row(row)
             rows.append(row)
             stats["written"] = int(stats["written"]) + 1
@@ -2248,8 +2341,8 @@ def crawl_live() -> tuple[list[dict[str, str]], dict[str, object]]:
 # 主程序
 # ============================================================
 
-def run(*, clear_stop: bool = True) -> dict:
-    """执行一次纯本地抓取，并输出结构化运行报告。"""
+def run(*, clear_stop: bool = True, local_only: bool = False) -> dict:
+    """抓取洛杉矶当天刷新记录，默认追加到招聘信息监控页面。"""
     if clear_stop:
         STOP_EVENT.clear()
 
@@ -2257,7 +2350,8 @@ def run(*, clear_stop: bool = True) -> dict:
     started_perf = time.perf_counter()
 
     print("=" * 76)
-    _log("开始", "ChineseInLA 招聘采集 | 本地 CSV | 单次抓到底")
+    _log("开始", "ChineseInLA 招聘采集 | 当天刷新 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
+    _log("日期", f"{run_started_at.date()} | America/Los_Angeles | 无刷新日期不纳入")
     _log("配置", f"类型={JOB_TYPE_FILTER} | 跳过置顶={'是' if SKIP_PINNED else '否'}")
     _log(
         "配置",
@@ -2268,7 +2362,14 @@ def run(*, clear_stop: bool = True) -> dict:
     _log("规则", "不读取历史、不去重、按网页顺序、每条成功后立即写入")
     print("=" * 76)
 
-    rows, stats = crawl_live()
+    writer = None if local_only else NotionWriter(run_started_at.date())
+    try:
+        if writer is not None:
+            writer.check_page()
+        rows, stats = crawl_live(run_started_at.date(), writer)
+    finally:
+        if writer is not None:
+            writer.close()
 
     run_finished_at = datetime.now(LA_TZ)
     elapsed_seconds = max(0.0, time.perf_counter() - started_perf)
@@ -2287,7 +2388,10 @@ def run(*, clear_stop: bool = True) -> dict:
     status_text = "已停止" if stop_reason == "user_stop" else "已完成"
 
     result = {
-        "mode": "live_mobile_local_single_run",
+        "mode": "today_refreshed_single_run",
+        "target_date": str(run_started_at.date()),
+        "notion_page_id": None if local_only else NOTION_PAGE_ID,
+        "notion_written": 0 if writer is None else writer.count,
         "run_started_at": run_started_at.isoformat(timespec="seconds"),
         "run_finished_at": run_finished_at.isoformat(timespec="seconds"),
         "elapsed_seconds": round(elapsed_seconds, 2),
@@ -2298,7 +2402,7 @@ def run(*, clear_stop: bool = True) -> dict:
         "forum_id": FORUM_ID,
         "job_type_filter": JOB_TYPE_FILTER,
         "skip_pinned": SKIP_PINNED,
-        "storage": "local_csv_append_no_dedupe",
+        "storage": "local_csv_append" if local_only else "notion_and_csv_append",
         "display_order": "forum_order",
         "written_rows": written,
         "valid_rows": written,
@@ -2330,6 +2434,8 @@ def run(*, clear_stop: bool = True) -> dict:
         f"  置顶帖子  ：{int(stats.get('pinned_found', 0))} 条"
     )
     print(f"类型跳过    ：{int(stats.get('type_skipped', 0))} 条")
+    print(f"日期跳过    ：{int(stats.get('date_skipped', 0))} 条")
+    print(f"Notion 写入 ：{result['notion_written']} 条")
     print(f"无效帖子    ：{int(stats.get('invalid', 0))} 条")
     print(f"详情失败    ：{int(stats.get('detail_failed', 0))} 条")
     print(f"列表失败    ：{int(stats.get('list_failed', 0))} 页")
@@ -2342,8 +2448,11 @@ def run(*, clear_stop: bool = True) -> dict:
 
 def run_cli() -> None:
     """执行一次采集后结束；无需桌面界面。"""
+    parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新的招聘信息并追加到 Notion")
+    parser.add_argument("--local-only", action="store_true", help="仅抓取并保存 CSV，不访问 Notion")
+    args = parser.parse_args()
     try:
-        run()
+        run(local_only=args.local_only)
     except KeyboardInterrupt:
         STOP_EVENT.set()
         print("\n用户中止。")
@@ -2353,6 +2462,7 @@ def run_cli() -> None:
         RuntimeError,
         ValueError,
         OSError,
+        requests.RequestException,
     ) as exc:
         print()
         print("=" * 72)
