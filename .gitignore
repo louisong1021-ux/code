@@ -1,0 +1,5 @@
+notion_token.txt
+.venv/
+__pycache__/
+logs/
+chineseinla_output/

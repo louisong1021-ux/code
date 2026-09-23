@@ -1,3 +1,9 @@
+import argparse
+import logging
+import random
+import signal
+import threading
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sys
@@ -9,6 +15,53 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
+
+
+LOGGER = logging.getLogger("chineseinla")
+STOP_EVENT = threading.Event()
+
+
+class SafeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        return datetime.fromtimestamp(record.created, ZoneInfo("America/Los_Angeles")).isoformat(timespec="seconds")
+
+    def format(self, record):
+        message = super().format(record)
+        token = globals().get("NOTION_TOKEN", "")
+        if token:
+            message = message.replace(token, "[REDACTED]")
+        return re.sub(r"(?:ntn_|secret_)[A-Za-z0-9_-]{10,}", "[REDACTED]", message)
+
+
+def configure_logging(debug=False, log_dir=None):
+    directory = Path(log_dir) if log_dir else Path(__file__).resolve().parent / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    LOGGER.setLevel(logging.DEBUG if debug else logging.INFO)
+    LOGGER.propagate = False
+    for handler in LOGGER.handlers[:]:
+        handler.close()
+        LOGGER.removeHandler(handler)
+    formatter = SafeFormatter("%(asctime)s | %(levelname)s | %(message)s")
+    console = logging.StreamHandler()
+    logfile = RotatingFileHandler(directory / "chineseinla.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    for handler in (console, logfile):
+        handler.setFormatter(formatter)
+        LOGGER.addHandler(handler)
+
+
+def log_message(*values, sep=" ", end="\n", flush=False, level=logging.INFO):
+    message = sep.join(str(value) for value in values).strip()
+    if not message or set(message) == {"="}:
+        return
+    if "❌" in message:
+        level = logging.ERROR
+    elif "⚠" in message:
+        level = logging.WARNING
+    LOGGER.log(level, message.replace("\r", ""))
+
+
+def debug_message(*values, **kwargs):
+    log_message(*values, level=logging.DEBUG, **kwargs)
 
 
 # ============================================================
@@ -331,7 +384,7 @@ def save_debug_html(html, filename):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / filename
     path.write_text(html, encoding="utf-8")
-    print("调试 HTML：", path)
+    log_message("调试 HTML：", path)
     return path
 
 
@@ -588,14 +641,14 @@ def find_main_window(
     candidates.sort(key=lambda item: item["score"], reverse=True)
     best = candidates[0]
 
-    print()
-    print("自动识别分页主列表：")
-    print(f"  DOM位置：{best['start'] + 1}～{best['end'] + 1}")
-    print(f"  匹配分数：{best['score']}")
+    debug_message()
+    debug_message("自动识别分页主列表：")
+    debug_message(f"  DOM位置：{best['start'] + 1}～{best['end'] + 1}")
+    debug_message(f"  匹配分数：{best['score']}")
 
     if len(candidates) >= 2:
         second = candidates[1]
-        print(
+        debug_message(
             f"  第二候选：{second['start'] + 1}～{second['end'] + 1}"
             f" / 分数 {second['score']}"
         )
@@ -618,8 +671,8 @@ def find_main_window(
 
             if previous_match is not None:
                 best = previous_match
-                print("  ✓ 候选分数接近")
-                print(
+                debug_message("  ✓ 候选分数接近")
+                debug_message(
                     "  ✓ 采用上一页主列表位置："
                     f"{best['start'] + 1}～{best['end'] + 1}"
                 )
@@ -633,12 +686,12 @@ def find_main_window(
     unknown_rows = [row for row in window if row["kind"] == "unknown"]
 
     if unknown_rows:
-        print()
-        print("无法解析的主列表帖子：")
+        debug_message()
+        debug_message("无法解析的主列表帖子：")
 
         for row in unknown_rows:
-            print("  -", row["title"])
-            print("    ", row["text"])
+            debug_message("  -", row["title"])
+            debug_message("    ", row["text"])
 
         raise RuntimeError("真正分页列表中存在无法解析帖子。")
 
@@ -674,8 +727,8 @@ def extract_posts_from_html(
     for row in parsed_rows:
         counts[row["kind"]] += 1
 
-    print("全部 topic_list_detail：", len(parsed_rows))
-    print(
+    debug_message("全部 topic_list_detail：", len(parsed_rows))
+    debug_message(
         "全页内容："
         f"今天 {counts['day0']} / "
         f"昨天 {counts['day1']} / "
@@ -700,8 +753,8 @@ def extract_posts_from_html(
 
     older_rows = [row for row in window if row["kind"] == "older"]
 
-    print()
-    print(
+    debug_message()
+    debug_message(
         "真正主列表："
         f"今天 {sum(1 for r in window if r['kind'] == 'day0')} / "
         f"昨天 {sum(1 for r in window if r['kind'] == 'day1')} / "
@@ -709,8 +762,8 @@ def extract_posts_from_html(
         f"更早 {len(older_rows)}"
     )
 
-    print()
-    print("选中的分页主列表：")
+    debug_message()
+    debug_message("选中的分页主列表：")
 
     labels = {
         "day0": "今天",
@@ -720,7 +773,7 @@ def extract_posts_from_html(
     }
 
     for row in window:
-        print(
+        debug_message(
             f"  [{labels.get(row['kind'], '未知')}] "
             f"[{row['updated']}] {row['title']}"
         )
@@ -781,14 +834,14 @@ def scrape_three_day_posts():
         run_date - timedelta(days=2),
     ]
 
-    print()
-    print("=" * 72)
-    print("ChineseInLA 装修论坛 → 最近 3 天全部帖子")
-    print("requests 后台模式，不会打开浏览器")
-    print("今天：", target_dates[0])
-    print("昨天：", target_dates[1])
-    print("前天：", target_dates[2])
-    print("=" * 72)
+    log_message()
+    log_message("=" * 72)
+    log_message("ChineseInLA 装修论坛 → 最近 3 天全部帖子")
+    log_message("requests 后台模式，不会打开浏览器")
+    log_message("今天：", target_dates[0])
+    log_message("昨天：", target_dates[1])
+    log_message("前天：", target_dates[2])
+    log_message("=" * 72)
 
     posts = []
     seen_urls = set()
@@ -810,10 +863,10 @@ def scrape_three_day_posts():
         page_number = page_index + 1
         url = get_page_url(page_index)
 
-        print()
-        print("=" * 72)
-        print(f"正在读取第 {page_number} 页...")
-        print(url)
+        log_message()
+        log_message("=" * 72)
+        log_message(f"正在读取第 {page_number} 页...")
+        log_message(url)
 
         try:
             response = get_forum_page(url)
@@ -822,7 +875,7 @@ def scrape_three_day_posts():
                 f"ChineseInLA 第 {page_number} 页请求失败：{error}"
             ) from error
 
-        print("HTTP：", response.status_code)
+        log_message("HTTP：", response.status_code)
         html = response.text
 
         if "topic_list_detail" not in html:
@@ -872,13 +925,13 @@ def scrape_three_day_posts():
             posts.append(post)
             new_posts.append(post)
 
-        print()
-        print(f"本页新增最近3天帖子：{len(new_posts)} 条")
-        print(f"目前累计最近3天帖子：{len(posts)} 条")
+        log_message()
+        log_message(f"本页新增最近3天帖子：{len(new_posts)} 条")
+        log_message(f"目前累计最近3天帖子：{len(posts)} 条")
 
         for post in new_posts:
             prefix = post["time"] if post["bucket"] == "day0" else post["date"]
-            print(f"  + [{prefix}] {post['title']}")
+            debug_message(f"  + [{prefix}] {post['title']}")
 
         if page_entered_dated_zone:
             entered_dated_zone = True
@@ -888,10 +941,10 @@ def scrape_three_day_posts():
 
         if boundary_reached:
             boundary_found = True
-            print()
-            print("✅ 已进入第 4 天或更早。")
-            print("✅ 最近 3 天完整边界已经确认。")
-            print("停止继续翻页。")
+            log_message()
+            log_message("✅ 已进入第 4 天或更早。")
+            log_message("✅ 最近 3 天完整边界已经确认。")
+            log_message("停止继续翻页。")
             break
 
         time.sleep(PAGE_DELAY)
@@ -919,11 +972,11 @@ def scrape_three_day_posts():
 
     posts = today_posts + other_posts
 
-    print()
-    print("=" * 72)
-    print("最近 3 天列表抓取完成")
-    print("最近3天帖子总数：", len(posts))
-    print("=" * 72)
+    log_message()
+    log_message("=" * 72)
+    log_message("最近 3 天列表抓取完成")
+    log_message("最近3天帖子总数：", len(posts))
+    log_message("=" * 72)
 
     return posts, run_started_at, target_dates
 
@@ -989,12 +1042,12 @@ def extract_topic_body(html):
 
 
 def fetch_post_bodies(posts):
-    print()
-    print("=" * 72)
-    print("开始读取最近 3 天帖子正文")
-    print("正文固定来源：桌面详情页 div.post_body p.real-content")
-    print("无其他 DOM / 无整页兜底")
-    print("=" * 72)
+    debug_message()
+    debug_message("=" * 72)
+    debug_message("开始读取最近 3 天帖子正文")
+    debug_message("正文固定来源：桌面详情页 div.post_body p.real-content")
+    debug_message("无其他 DOM / 无整页兜底")
+    debug_message("=" * 72)
 
     total = len(posts)
 
@@ -1002,7 +1055,7 @@ def fetch_post_bodies(posts):
         posts,
         start=1,
     ):
-        print(
+        debug_message(
             f"[{index}/{total}] "
             f"{post['title']}"
         )
@@ -1013,7 +1066,7 @@ def fetch_post_bodies(posts):
         )
 
         if not detail_url:
-            print(
+            debug_message(
                 "  ⚠ 原帖 URL 为空"
             )
 
@@ -1029,7 +1082,7 @@ def fetch_post_bodies(posts):
                 detail_url
             )
 
-            print(
+            debug_message(
                 "  桌面详情："
                 f"HTTP {response.status_code} | "
                 f"{response.url}"
@@ -1040,9 +1093,9 @@ def fetch_post_bodies(posts):
             )
 
             if not body:
-                print(
+                debug_message(
                     "  ⚠ 未找到 "
-                    "div.post_body p.real-content"
+                    "div.post_body p.real-content：", detail_url
                 )
 
                 topic_match = TOPIC_ID_RE.search(
@@ -1069,7 +1122,7 @@ def fetch_post_bodies(posts):
                 post["body_ok"] = False
 
             else:
-                print(
+                debug_message(
                     "  ✓ real-content："
                     f"{len(body)} 字符"
                 )
@@ -1078,8 +1131,9 @@ def fetch_post_bodies(posts):
                 post["body_ok"] = True
 
         except Exception as error:
-            print(
+            debug_message(
                 "  ⚠ 正文读取失败：",
+                detail_url,
                 error,
             )
 
@@ -1093,6 +1147,9 @@ def fetch_post_bodies(posts):
             DETAIL_DELAY
         )
 
+    LOGGER.info("正文读取完成：总数 %s，成功 %s，未提取 %s", len(posts),
+                sum(bool(p.get("body_ok")) for p in posts),
+                sum(not p.get("body_ok") for p in posts))
     return posts
 
 
@@ -1102,13 +1159,13 @@ def fetch_post_bodies(posts):
 
 
 def validate_posts(posts, run_date, target_dates):
-    print()
-    print("正在检查最近 3 天全部帖子...")
+    log_message()
+    log_message("正在检查最近 3 天全部帖子...")
 
     urls = [post["url"] for post in posts]
 
     if len(urls) != len(set(urls)):
-        print("❌ 存在重复 URL")
+        log_message("❌ 存在重复 URL")
         return False
 
     valid_buckets = {"day0", "day1", "day2"}
@@ -1119,39 +1176,39 @@ def validate_posts(posts, run_date, target_dates):
         bucket = post.get("bucket")
 
         if not title:
-            print("❌ 空标题")
+            log_message("❌ 空标题")
             return False
 
         if "�" in title:
-            print("❌ 标题乱码：", title)
+            log_message("❌ 标题乱码：", title)
             return False
 
         if not url.startswith("https://www.chineseinla.com/f/page_viewtopic/"):
-            print("❌ 异常 URL：", url)
+            log_message("❌ 异常 URL：", url)
             return False
 
         if bucket not in valid_buckets:
-            print("❌ 分类异常：", bucket, title)
+            log_message("❌ 分类异常：", bucket, title)
             return False
 
         if bucket == "day0":
             if not TIME_RE.fullmatch(post.get("time", "")):
-                print("❌ 今天时间异常：", post.get("time"), title)
+                log_message("❌ 今天时间异常：", post.get("time"), title)
                 return False
         else:
             post_date = parse_date(post.get("date", ""))
             expected = target_dates[1] if bucket == "day1" else target_dates[2]
 
             if post_date != expected:
-                print("❌ 日期异常：", post.get("date"), title)
+                log_message("❌ 日期异常：", post.get("date"), title)
                 return False
 
         if not isinstance(post.get("body", ""), str):
-            print("❌ 正文类型异常：", title)
+            log_message("❌ 正文类型异常：", title)
             return False
 
-    print("✅ 数据检查通过")
-    print("   全部帖子：", len(posts), "条")
+    log_message("✅ 数据检查通过")
+    log_message("   全部帖子：", len(posts), "条")
     return True
 
 
@@ -1177,8 +1234,8 @@ def notion_request(method, url, **kwargs):
                 raise
 
             wait = min(2 ** attempt, 10)
-            print("⚠ Notion 网络错误：", error)
-            print(f"{wait} 秒后重试...")
+            log_message("⚠ Notion 网络错误：", error)
+            log_message(f"{wait} 秒后重试...")
             time.sleep(wait)
             continue
 
@@ -1190,7 +1247,7 @@ def notion_request(method, url, **kwargs):
             except ValueError:
                 retry_after = 1
 
-            print(f"⚠ Notion 限流，{retry_after} 秒后重试...")
+            log_message(f"⚠ Notion 限流，{retry_after} 秒后重试...")
             time.sleep(retry_after)
             continue
 
@@ -1199,7 +1256,7 @@ def notion_request(method, url, **kwargs):
                 response.raise_for_status()
 
             wait = min(2 ** attempt, 10)
-            print(
+            log_message(
                 f"⚠ Notion 临时错误 {response.status_code}，"
                 f"{wait} 秒后重试..."
             )
@@ -1213,18 +1270,18 @@ def notion_request(method, url, **kwargs):
 
 
 def test_notion():
-    print()
-    print("正在检查 Notion 连接...")
+    log_message()
+    log_message("正在检查 Notion 连接...")
 
     url = f"https://api.notion.com/v1/pages/{NOTION_PAGE_ID}"
 
     try:
         notion_request("GET", url)
     except Exception as error:
-        print("❌ Notion 连接失败：", error)
+        log_message("❌ Notion 连接失败：", error)
         return False
 
-    print("✅ Notion 连接正常")
+    log_message("✅ Notion 连接正常")
     return True
 
 
@@ -1460,7 +1517,7 @@ def write_new_blocks(blocks):
             if block_id:
                 created_ids.append(block_id)
 
-        print(f"新写入：{len(created_ids)}/{len(blocks)}")
+        log_message(f"新写入：{len(created_ids)}/{len(blocks)}")
         time.sleep(0.4)
 
     return created_ids
@@ -1478,14 +1535,14 @@ def delete_one_block(block_id):
         if response is not None and response.status_code == 404:
             return True
 
-        print()
-        print("⚠ 删除 block 失败：", block_id)
-        print(error)
+        log_message()
+        log_message("⚠ 删除 block 失败：", block_id)
+        log_message(error)
         return False
     except Exception as error:
-        print()
-        print("⚠ 删除 block 失败：", block_id)
-        print(error)
+        log_message()
+        log_message("⚠ 删除 block 失败：", block_id)
+        log_message(error)
         return False
 
 
@@ -1503,14 +1560,11 @@ def delete_block_ids_resilient(block_ids, label):
         if not success:
             failed.append(block_id)
 
-        print(
-            f"\r{label}：{index}/{total} | 失败 {len(failed)}",
-            end="",
-            flush=True,
-        )
+        if index % 25 == 0 or index == total:
+            LOGGER.info("%s：%s/%s | 失败 %s", label, index, total, len(failed))
         time.sleep(DELETE_DELAY)
 
-    print()
+    log_message()
     return failed
 
 
@@ -1525,9 +1579,9 @@ def verify_new_blocks_exist(created_ids):
     missing_new = set(created_ids) - current_ids
 
     if missing_new:
-        print()
-        print("❌ 新写入内容有 block 消失")
-        print("缺少：", len(missing_new))
+        log_message()
+        log_message("❌ 新写入内容有 block 消失")
+        log_message("缺少：", len(missing_new))
         return False
 
     return True
@@ -1538,18 +1592,18 @@ def cleanup_old_blocks(old_delete_ids, created_ids):
     new_ids = set(created_ids)
 
     if not target_old_ids:
-        print("没有需要删除的旧 block。")
+        log_message("没有需要删除的旧 block。")
         return True
 
-    print()
-    print("=" * 72)
-    print("开始清理上一版 Notion 内容")
-    print("=" * 72)
-    print("需要清理：", len(target_old_ids), "个旧 block")
+    log_message()
+    log_message("=" * 72)
+    log_message("开始清理上一版 Notion 内容")
+    log_message("=" * 72)
+    log_message("需要清理：", len(target_old_ids), "个旧 block")
 
     for pass_number in range(1, DELETE_VERIFY_PASSES + 1):
-        print()
-        print(f"清理检查第 {pass_number}/{DELETE_VERIFY_PASSES} 轮")
+        log_message()
+        log_message(f"清理检查第 {pass_number}/{DELETE_VERIFY_PASSES} 轮")
 
         current_blocks = get_all_notion_blocks()
         current_ids = {
@@ -1561,15 +1615,15 @@ def cleanup_old_blocks(old_delete_ids, created_ids):
         missing_new = new_ids - current_ids
 
         if missing_new:
-            print("❌ 新数据验证失败")
-            print("缺少新 block：", len(missing_new))
+            log_message("❌ 新数据验证失败")
+            log_message("缺少新 block：", len(missing_new))
             return False
 
         remaining = target_old_ids & current_ids
-        print("旧 block 剩余：", len(remaining))
+        log_message("旧 block 剩余：", len(remaining))
 
         if not remaining:
-            print("✅ 所有旧 block 已确认删除")
+            log_message("✅ 所有旧 block 已确认删除")
             return True
 
         failed = delete_block_ids_resilient(
@@ -1578,7 +1632,7 @@ def cleanup_old_blocks(old_delete_ids, created_ids):
         )
 
         if failed:
-            print("⚠ 本轮删除失败：", len(failed))
+            log_message("⚠ 本轮删除失败：", len(failed))
 
         time.sleep(1.0)
 
@@ -1593,14 +1647,14 @@ def cleanup_old_blocks(old_delete_ids, created_ids):
     missing_new = new_ids - current_ids
 
     if missing_new:
-        print("❌ 最终验证失败：新内容不完整")
+        log_message("❌ 最终验证失败：新内容不完整")
         return False
 
     if remaining:
-        print("❌ 旧内容仍有残留：", len(remaining))
+        log_message("❌ 旧内容仍有残留：", len(remaining))
         return False
 
-    print("✅ 最终验证通过：旧 block = 0")
+    log_message("✅ 最终验证通过：旧 block = 0")
     return True
 
 
@@ -1623,17 +1677,17 @@ def rollback_new_blocks(old_ids):
                 rollback_ids.append(block_id)
 
         if rollback_ids:
-            print()
-            print("准备回滚：", len(rollback_ids), "个新 block")
+            log_message()
+            log_message("准备回滚：", len(rollback_ids), "个新 block")
             delete_block_ids_resilient(rollback_ids, "回滚")
 
     except Exception as error:
-        print("⚠ 自动回滚失败：", error)
+        log_message("⚠ 自动回滚失败：", error)
 
 
 def update_notion(posts, run_date, target_dates):
     if not test_notion():
-        print("Notion 不会被修改。")
+        log_message("Notion 不会被修改。")
         return False
 
     new_blocks = build_notion_blocks(posts, run_date, target_dates)
@@ -1657,21 +1711,21 @@ def update_notion(posts, run_date, target_dates):
 
         if block_type in PROTECTED_BLOCK_TYPES:
             protected_old_count += 1
-            print("⚠ 保留受保护内容：", block_type)
+            log_message("⚠ 保留受保护内容：", block_type)
             continue
 
         old_delete_ids.append(block_id)
 
-    print()
-    print("当前 Notion 顶层 block：", len(old_blocks))
-    print("准备删除的旧 block：", len(old_delete_ids))
+    log_message()
+    log_message("当前 Notion 顶层 block：", len(old_blocks))
+    log_message("准备删除的旧 block：", len(old_delete_ids))
 
     if protected_old_count:
-        print("受保护 block：", protected_old_count)
+        log_message("受保护 block：", protected_old_count)
 
     try:
-        print()
-        print("正在写入新的最近 3 天全部帖子结果...")
+        log_message()
+        log_message("正在写入新的最近 3 天全部帖子结果...")
         created_ids = write_new_blocks(new_blocks)
 
         if len(created_ids) != len(new_blocks):
@@ -1681,21 +1735,21 @@ def update_notion(posts, run_date, target_dates):
             )
 
     except Exception as error:
-        print()
-        print("❌ 新结果写入失败：", error)
-        print("正在保护旧数据并回滚本次新增...")
+        log_message()
+        log_message("❌ 新结果写入失败：", error)
+        log_message("正在保护旧数据并回滚本次新增...")
         rollback_new_blocks(old_ids)
-        print("旧 Notion 数据不会删除。")
+        log_message("旧 Notion 数据不会删除。")
         return False
 
-    print()
-    print("✅ 新结果完整写入：", len(created_ids), "个顶层 block")
+    log_message()
+    log_message("✅ 新结果完整写入：", len(created_ids), "个顶层 block")
 
     if not verify_new_blocks_exist(created_ids):
-        print("❌ 新结果验证失败，旧内容不会删除。")
+        log_message("❌ 新结果验证失败，旧内容不会删除。")
         return False
 
-    print("✅ 新结果存在性验证通过")
+    log_message("✅ 新结果存在性验证通过")
 
     cleanup_success = cleanup_old_blocks(
         old_delete_ids,
@@ -1703,7 +1757,7 @@ def update_notion(posts, run_date, target_dates):
     )
 
     if not cleanup_success:
-        print("⚠ 新结果已经写入，但旧结果仍有残留。")
+        log_message("⚠ 新结果已经写入，但旧结果仍有残留。")
         return False
 
     final_blocks = get_all_notion_blocks()
@@ -1717,26 +1771,26 @@ def update_notion(posts, run_date, target_dates):
     missing_new = created_set - final_ids
     remaining_old = set(old_delete_ids) & final_ids
 
-    print()
-    print("=" * 72)
-    print("Notion 最终验证")
-    print("=" * 72)
-    print("本次新顶层 block：", len(created_set))
-    print("新 block 缺失：", len(missing_new))
-    print("旧 block 残留：", len(remaining_old))
+    log_message()
+    log_message("=" * 72)
+    log_message("Notion 最终验证")
+    log_message("=" * 72)
+    log_message("本次新顶层 block：", len(created_set))
+    log_message("新 block 缺失：", len(missing_new))
+    log_message("旧 block 残留：", len(remaining_old))
 
     if missing_new or remaining_old:
-        print()
-        print("❌ Notion 最终验证失败")
+        log_message()
+        log_message("❌ Notion 最终验证失败")
         return False
 
-    print()
-    print("✅ Notion 最终验证通过")
-    print("✅ 最近 3 天全部帖子已写入")
-    print("✅ 作者未写入")
-    print("✅ 每条帖子可展开查看正文")
-    print("✅ 旧数据残留 = 0")
-    print("✅ Notion 更新完成")
+    log_message()
+    log_message("✅ Notion 最终验证通过")
+    log_message("✅ 最近 3 天全部帖子已写入")
+    log_message("✅ 作者未写入")
+    log_message("✅ 每条帖子可展开查看正文")
+    log_message("✅ 旧数据残留 = 0")
+    log_message("✅ Notion 更新完成")
 
     return True
 
@@ -1749,36 +1803,36 @@ def update_notion(posts, run_date, target_dates):
 def main():
     global NOTION_TOKEN
 
-    print()
-    print("=" * 72)
-    print("ChineseInLA 装修 → Notion 最近 3 天全部帖子自动同步")
-    print("抓取全部帖子 / 不保存作者 / Toggle 展开正文")
-    print("后台 requests 模式，不会弹浏览器")
-    print("=" * 72)
+    log_message()
+    log_message("=" * 72)
+    log_message("ChineseInLA 装修 → Notion 最近 3 天全部帖子自动同步")
+    log_message("抓取全部帖子 / 不保存作者 / Toggle 展开正文")
+    log_message("后台 requests 模式，不会弹浏览器")
+    log_message("=" * 72)
 
     # 每次运行都重新读取 Token，方便直接修改同目录的 notion_token.txt
     try:
         NOTION_TOKEN = load_notion_token()
     except (RuntimeError, OSError) as error:
-        print()
-        print("❌ Notion Token 读取失败：")
-        print(error)
+        log_message()
+        log_message("❌ Notion Token 读取失败：")
+        log_message(error)
         return False
 
     # notion_headers 在模块加载时已经创建，所以必须同步刷新 Authorization。
     notion_headers["Authorization"] = f"Bearer {NOTION_TOKEN}"
 
-    print()
-    print(f"✅ Notion Token 已读取：{TOKEN_FILE.name}")
+    log_message()
+    log_message(f"✅ Notion Token 已读取：{TOKEN_FILE.name}")
 
     try:
         posts, run_started_at, target_dates = scrape_three_day_posts()
     except Exception as error:
-        print()
-        print("❌ 网页列表抓取失败：")
-        print(error)
-        print()
-        print("Notion 不会被修改。")
+        log_message()
+        log_message("❌ 网页列表抓取失败：")
+        log_message(error)
+        log_message()
+        log_message("Notion 不会被修改。")
         return False
 
     run_date = run_started_at.date()
@@ -1786,23 +1840,23 @@ def main():
     try:
         posts = fetch_post_bodies(posts)
     except Exception as error:
-        print()
-        print("❌ 正文读取失败：")
-        print(error)
-        print()
-        print("Notion 不会被修改。")
+        log_message()
+        log_message("❌ 正文读取失败：")
+        log_message(error)
+        log_message()
+        log_message("Notion 不会被修改。")
         return False
 
     if not validate_posts(posts, run_date, target_dates):
-        print()
-        print("⚠ 抓取结果没有通过安全检查。")
-        print("Notion 不会被修改。")
+        log_message()
+        log_message("⚠ 抓取结果没有通过安全检查。")
+        log_message("Notion 不会被修改。")
         return False
 
     if datetime.now(LA_TIMEZONE).date() != run_date:
-        print()
-        print("❌ 当前已经跨过午夜。")
-        print("3 天时间窗口已经变化，Notion 不会更新。")
+        log_message()
+        log_message("❌ 当前已经跨过午夜。")
+        log_message("3 天时间窗口已经变化，Notion 不会更新。")
         return False
 
     by_bucket = {
@@ -1811,12 +1865,12 @@ def main():
         "day2": sum(1 for p in posts if p["bucket"] == "day2"),
     }
 
-    print()
-    print("准备同步到 Notion：")
-    print(f"今天 {target_dates[0]}：{by_bucket['day0']} 条")
-    print(f"昨天 {target_dates[1]}：{by_bucket['day1']} 条")
-    print(f"前天 {target_dates[2]}：{by_bucket['day2']} 条")
-    print("3天合计：", len(posts), "条")
+    log_message()
+    log_message("准备同步到 Notion：")
+    log_message(f"今天 {target_dates[0]}：{by_bucket['day0']} 条")
+    log_message(f"昨天 {target_dates[1]}：{by_bucket['day1']} 条")
+    log_message(f"前天 {target_dates[2]}：{by_bucket['day2']} 条")
+    log_message("3天合计：", len(posts), "条")
 
     try:
         success = update_notion(
@@ -1825,52 +1879,85 @@ def main():
             target_dates,
         )
     except Exception as error:
-        print()
-        print("❌ 更新 Notion 发生异常：")
-        print(error)
+        log_message()
+        log_message("❌ 更新 Notion 发生异常：")
+        log_message(error)
         return False
 
     if not success:
-        print()
-        print("=" * 72)
-        print("本次运行没有通过最终完整性验证")
-        print("请查看上方具体错误。")
-        print("=" * 72)
+        log_message()
+        log_message("=" * 72)
+        log_message("本次运行没有通过最终完整性验证")
+        log_message("请查看上方具体错误。")
+        log_message("=" * 72)
         return False
 
-    print()
-    print("=" * 72)
-    print("全部完成")
-    print(f"今天：{by_bucket['day0']} 条")
-    print(f"昨天：{by_bucket['day1']} 条")
-    print(f"前天：{by_bucket['day2']} 条")
-    print(f"3天合计：{len(posts)} 条")
-    print("作者字段：不保存")
-    print("正文：Notion Toggle 点击展开")
-    print("浏览器弹窗：0")
-    print("退出代码：0")
-    print("=" * 72)
+    log_message()
+    log_message("=" * 72)
+    log_message("全部完成")
+    log_message(f"今天：{by_bucket['day0']} 条")
+    log_message(f"昨天：{by_bucket['day1']} 条")
+    log_message(f"前天：{by_bucket['day2']} 条")
+    log_message(f"3天合计：{len(posts)} 条")
+    log_message("作者字段：不保存")
+    log_message("正文：Notion Toggle 点击展开")
+    log_message("浏览器弹窗：0")
+    log_message("本轮同步成功")
+    log_message("=" * 72)
 
     return True
 
 
-if __name__ == "__main__":
+
+def request_stop(signum, frame):
+    # Finish an active synchronization before stopping to avoid partial writes.
+    STOP_EVENT.set()
+
+
+def run_loop(once=False):
+    round_number = 0
+    while not STOP_EVENT.is_set():
+        round_number += 1
+        started = time.monotonic()
+        LOGGER.info("第 %s 轮开始", round_number)
+        try:
+            success = bool(main())
+        except Exception:
+            LOGGER.exception("本轮发生未处理异常；下轮将重试")
+            success = False
+        elapsed = time.monotonic() - started
+        LOGGER.log(logging.INFO if success else logging.ERROR,
+                   "第 %s 轮结束 | 状态=%s | 耗时=%.1f秒",
+                   round_number, "成功" if success else "失败", elapsed)
+        if once:
+            return 0 if success else 1
+        if STOP_EVENT.is_set():
+            break
+        delay = random.randint(55 * 60, 60 * 60)
+        next_run = datetime.now(LA_TIMEZONE) + timedelta(seconds=delay)
+        LOGGER.info("等待 %.1f 分钟；下次执行 %s", delay / 60, next_run.isoformat(timespec="seconds"))
+        STOP_EVENT.wait(delay)
+    LOGGER.info("已停止；当前同步已结束")
+    return 0
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="ChineseInLA 装修帖子持续同步至 Notion")
+    parser.add_argument("--once", action="store_true", help="只执行一轮后退出")
+    parser.add_argument("--debug", action="store_true", help="记录分页识别及逐条抓取详情")
+    args = parser.parse_args()
+    configure_logging(args.debug)
+    STOP_EVENT.clear()
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    LOGGER.info("启动：%s；日志时区 America/Los_Angeles", "单次模式" if args.once else "持续模式，每轮结束后等待55–60分钟")
     try:
-        success = main()
-        sys.exit(0 if success else 1)
+        return run_loop(args.once)
+    finally:
+        forum_session.close()
+        notion_session.close()
+        logging.shutdown()
 
-    except KeyboardInterrupt:
-        print()
-        print("你手动停止了程序。")
-        sys.exit(130)
 
-    except Exception as error:
-        print()
-        print("=" * 72)
-        print("程序发生未处理错误")
-        print("=" * 72)
-        print()
-        print(error)
-        print()
-        print("Notion 更新不能认为成功。")
-        sys.exit(1)
+if __name__ == "__main__":
+    sys.exit(cli())
