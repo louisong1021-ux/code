@@ -69,6 +69,7 @@ def debug_message(*values, **kwargs):
 # ============================================================
 
 NOTION_PAGE_ID = "3dcc18c6fba480e4b1ced952643da794"
+ACTIVE_DAILY_PAGE_ID = None
 
 # Notion Token 与招聘脚本保持同一种管理方式：
 # 在本脚本同目录创建 notion_token.txt
@@ -535,18 +536,6 @@ def find_main_window(
         raise RuntimeError(f"第 {page_number} 页普通帖子数量异常：{len(parsed_rows)}，预期 {PAGE_STEP}；禁止更新 Notion。")
     if any(row["kind"] == "unknown" for row in parsed_rows):
         raise RuntimeError("普通分页列表中存在无法解析的帖子；禁止更新 Notion。")
-    urls = [row["url"] for row in parsed_rows]
-    if len(set(urls)) != len(urls):
-        raise RuntimeError("普通分页列表存在重复帖子；禁止更新 Notion。")
-    keys = [(row["date"], row["minutes"]) for row in parsed_rows]
-    if any(right > left for left, right in zip(keys, keys[1:])):
-        raise RuntimeError("普通帖子日期顺序异常；禁止更新 Notion。")
-    today_rows = [row for row in parsed_rows if row["kind"] == "day0"]
-    if entered_dated_zone and today_rows:
-        raise RuntimeError("已进入历史日期后再次出现今天帖子；禁止更新 Notion。")
-    if previous_last_minutes is not None and today_rows and today_rows[0]["minutes"] > previous_last_minutes:
-        raise RuntimeError("跨页帖子时间顺序异常；禁止更新 Notion。")
-    LOGGER.info("第 %s 页结构识别成功：%s 条普通帖子", page_number, len(parsed_rows))
     return parsed_rows, parsed_rows[0]["dom_index"]
 
 def extract_posts_from_html(
@@ -594,10 +583,10 @@ def extract_posts_from_html(
     target_rows = [
         row
         for row in window
-        if row["kind"] in {"day0", "day1", "day2"}
+        if row["kind"] == "day0"
     ]
 
-    older_rows = [row for row in window if row["kind"] == "older"]
+    older_rows = [row for row in window if row["kind"] != "day0"]
 
     debug_message()
     debug_message(
@@ -666,11 +655,61 @@ def extract_posts_from_html(
 
 
 # ============================================================
-# 抓最近 3 天列表
+# 抓今天列表
 # ============================================================
 
 
-def scrape_three_day_posts():
+def post_timestamp(post):
+    value = post.get("refresh_time") or post.get("publish_time") or post.get("time") or ""
+    for fmt in ("%Y/%m/%d %I:%M %p", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(value.strip().replace(",", ""), fmt)
+        except ValueError:
+            pass
+    if TIME_RE.fullmatch(value):
+        day = parse_date(post.get("date", ""))
+        if day:
+            return datetime.combine(day, datetime.min.time()) + timedelta(minutes=time_to_minutes(value))
+    return datetime.min
+
+
+def deduplicate_posts(posts):
+    # Keep the first website position, replacing its fields with the newest sighting.
+    unique = {}
+    for post in posts:
+        match = TOPIC_ID_RE.search(post.get("url", ""))
+        if not match:
+            raise ValueError("帖子缺少有效 ID，停止同步")
+        pid = match.group(1)
+        old = unique.get(pid)
+        if old is None or post_timestamp(post) >= post_timestamp(old):
+            unique[pid] = dict(post)
+    return list(unique.values())
+
+
+def extract_post_times(html):
+    soup = BeautifulSoup(html, "html.parser")
+    container = soup.select_one("div.post_time")
+    if not container:
+        return "", ""
+    text = container.get_text(" ", strip=True)
+    stamp = r"(20\d{2}[/-]\d{2}[/-]\d{2},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?)"
+    published = re.search(r"发布于\s*[:：]?\s*" + stamp, text, re.I)
+    refreshed = re.search(r"(?:更新于|刷新于)\s*[:：]?\s*" + stamp, text, re.I)
+    return (clean_text(published.group(1)).replace(",", "") if published else "",
+            clean_text(refreshed.group(1)).replace(",", "") if refreshed else "")
+
+
+def set_post_times(post, html):
+    post["publish_time"], post["refresh_time"] = extract_post_times(html)
+    # Forum rows expose the latest bump; detail '更新于' can lag behind that bump.
+    listing = dict(post, refresh_time="", publish_time="")
+    if post_timestamp(listing) > post_timestamp(post):
+        post["refresh_time"] = f"{post['date']} {post['time']}"
+
+
+
+def scrape_today_posts():
     run_started_at = datetime.now(LA_TIMEZONE)
     run_date = run_started_at.date()
 
@@ -682,15 +721,12 @@ def scrape_three_day_posts():
 
     log_message()
     log_message("=" * 72)
-    log_message("ChineseInLA 装修论坛 → 最近 3 天全部帖子")
+    log_message("ChineseInLA 装修论坛 → 今天全部帖子")
     log_message("requests 后台模式，不会打开浏览器")
     log_message("今天：", target_dates[0])
-    log_message("昨天：", target_dates[1])
-    log_message("前天：", target_dates[2])
     log_message("=" * 72)
 
     posts = []
-    seen_urls = set()
 
     previous_last_minutes = None
     previous_window_start = None
@@ -703,7 +739,7 @@ def scrape_three_day_posts():
         if current_date != run_date:
             raise RuntimeError(
                 "抓取过程中已经跨过午夜。"
-                "为了避免 3 天时间窗口发生变化，本次禁止更新 Notion。"
+                "为了避免 当天日期发生变化，本次禁止更新 Notion。"
             )
 
         page_number = page_index + 1
@@ -764,16 +800,12 @@ def scrape_three_day_posts():
         new_posts = []
 
         for post in page_posts:
-            if post["url"] in seen_urls:
-                continue
-
-            seen_urls.add(post["url"])
             posts.append(post)
             new_posts.append(post)
 
         log_message()
-        log_message(f"本页新增最近3天帖子：{len(new_posts)} 条")
-        log_message(f"目前累计最近3天帖子：{len(posts)} 条")
+        log_message(f"本页新增今天帖子：{len(new_posts)} 条")
+        log_message(f"目前累计今天帖子：{len(posts)} 条")
 
         for post in new_posts:
             prefix = post["time"] if post["bucket"] == "day0" else post["date"]
@@ -788,8 +820,8 @@ def scrape_three_day_posts():
         if boundary_reached:
             boundary_found = True
             log_message()
-            log_message("✅ 已进入第 4 天或更早。")
-            log_message("✅ 最近 3 天完整边界已经确认。")
+            log_message("✅ 已进入昨天或更早。")
+            log_message("✅ 今天完整边界已经确认。")
             log_message("停止继续翻页。")
             break
 
@@ -797,8 +829,8 @@ def scrape_three_day_posts():
 
     if not boundary_found:
         raise RuntimeError(
-            f"已经读取最多 {MAX_PAGES} 页，仍没有进入第 4 天或更早。\n\n"
-            "无法证明最近 3 天数据完整，本次禁止更新 Notion。"
+            f"已经读取最多 {MAX_PAGES} 页，仍没有进入昨天或更早。\n\n"
+            "无法证明今天数据完整，本次禁止更新 Notion。"
         )
 
     if datetime.now(LA_TIMEZONE).date() != run_date:
@@ -807,21 +839,12 @@ def scrape_three_day_posts():
             "本次数据作废，Notion 不会更新。"
         )
 
-    # 今天按具体时间倒序；昨天/前天保留论坛原始顺序
-    today_posts = [post for post in posts if post["bucket"] == "day0"]
-    other_posts = [post for post in posts if post["bucket"] != "day0"]
-
-    today_posts.sort(
-        key=lambda post: time_to_minutes(post["time"]),
-        reverse=True,
-    )
-
-    posts = today_posts + other_posts
+    posts = deduplicate_posts(posts)
 
     log_message()
     log_message("=" * 72)
-    log_message("最近 3 天列表抓取完成")
-    log_message("最近3天帖子总数：", len(posts))
+    log_message("今天列表抓取完成")
+    log_message("今天帖子总数：", len(posts))
     log_message("=" * 72)
 
     return posts, run_started_at, target_dates
@@ -890,7 +913,7 @@ def extract_topic_body(html):
 def fetch_post_bodies(posts):
     debug_message()
     debug_message("=" * 72)
-    debug_message("开始读取最近 3 天帖子正文")
+    debug_message("开始读取今天帖子正文")
     debug_message("正文固定来源：桌面详情页 div.post_body p.real-content")
     debug_message("无其他 DOM / 无整页兜底")
     debug_message("=" * 72)
@@ -933,6 +956,8 @@ def fetch_post_bodies(posts):
                 f"HTTP {response.status_code} | "
                 f"{response.url}"
             )
+
+            set_post_times(post, response.text)
 
             body = extract_topic_body(
                 response.text
@@ -1006,7 +1031,7 @@ def fetch_post_bodies(posts):
 
 def validate_posts(posts, run_date, target_dates):
     log_message()
-    log_message("正在检查最近 3 天全部帖子...")
+    log_message("正在检查今天全部帖子...")
 
     urls = [post["url"] for post in posts]
 
@@ -1014,7 +1039,7 @@ def validate_posts(posts, run_date, target_dates):
         log_message("❌ 存在重复 URL")
         return False
 
-    valid_buckets = {"day0", "day1", "day2"}
+    valid_buckets = {"day0"}
 
     for post in posts:
         title = post.get("title", "")
@@ -1038,6 +1063,9 @@ def validate_posts(posts, run_date, target_dates):
             return False
 
         if bucket == "day0":
+            if post.get("date") != str(run_date):
+                log_message("❌ 非当天帖子，停止同步")
+                return False
             if not TIME_RE.fullmatch(post.get("time", "")):
                 log_message("❌ 今天时间异常：", post.get("time"), title)
                 return False
@@ -1133,7 +1161,7 @@ def test_notion():
 
 def get_all_notion_blocks():
     blocks = []
-    url = f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children"
+    url = f"https://api.notion.com/v1/blocks/{daily_page_id()}/children"
     cursor = None
 
     while True:
@@ -1247,94 +1275,12 @@ def make_toggle_post_block(number, prefix, post):
 
 
 def build_notion_blocks(posts, run_date, target_dates):
-    now = datetime.now(LA_TIMEZONE)
-    updated_at = now.strftime("%Y-%m-%d %H:%M")
-
-    by_bucket = {
-        "day0": [post for post in posts if post["bucket"] == "day0"],
-        "day1": [post for post in posts if post["bucket"] == "day1"],
-        "day2": [post for post in posts if post["bucket"] == "day2"],
-    }
-
-    blocks = [
-        {
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {"content": f"最后更新：{updated_at}"},
-                        "annotations": {"color": "gray"},
-                    }
-                ]
-            },
-        },
-        {
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {"content": f"最近3天共 {len(posts)} 条帖子"},
-                        "annotations": {"bold": True},
-                    }
-                ]
-            },
-        },
-        {
-            "object": "block",
-            "type": "divider",
-            "divider": {},
-        },
-    ]
-
-    sections = [
-        ("day0", "今天", target_dates[0]),
-        ("day1", "昨天", target_dates[1]),
-        ("day2", "前天", target_dates[2]),
-    ]
-
-    for section_index, (bucket, label, section_date) in enumerate(sections):
-        section_posts = by_bucket[bucket]
-
-        blocks.append(
-            {
-                "object": "block",
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [
-                        {
-                            "type": "text",
-                            "text": {
-                                "content": (
-                                    f"{label} · {section_date} "
-                                    f"（{len(section_posts)} 条）"
-                                )
-                            },
-                        }
-                    ]
-                },
-            }
-        )
-
-        if section_posts:
-            for number, post in enumerate(section_posts, start=1):
-                prefix = post["time"] if bucket == "day0" else str(section_date)
-                blocks.append(make_toggle_post_block(number, prefix, post))
-        else:
-            blocks.append(make_plain_paragraph("没有帖子", color="gray"))
-
-        if section_index < len(sections) - 1:
-            blocks.append(
-                {
-                    "object": "block",
-                    "type": "divider",
-                    "divider": {},
-                }
-            )
-
+    posts = deduplicate_posts(posts)
+    blocks = [make_plain_paragraph(f"最后更新：{datetime.now(LA_TIMEZONE):%Y-%m-%d %H:%M}"),
+              make_plain_paragraph(f"{run_date} · {len(posts)} 条装修帖子")]
+    for number, post in enumerate(posts, 1):
+        prefix = post.get("refresh_time") or post.get("publish_time") or post.get("time") or post.get("date")
+        blocks.append(make_toggle_post_block(number, prefix, post))
     return blocks
 
 
@@ -1344,7 +1290,7 @@ def build_notion_blocks(posts, run_date, target_dates):
 
 
 def write_new_blocks(blocks):
-    url = f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children"
+    url = f"https://api.notion.com/v1/blocks/{daily_page_id()}/children"
     created_ids = []
 
     for start in range(0, len(blocks), 100):
@@ -1531,7 +1477,59 @@ def rollback_new_blocks(old_ids):
         log_message("⚠ 自动回滚失败：", error)
 
 
+def daily_page_id():
+    if not ACTIVE_DAILY_PAGE_ID:
+        raise RuntimeError("未选择日期子页面，禁止修改监控主页")
+    return ACTIVE_DAILY_PAGE_ID
+
+
+def ensure_daily_page(run_date):
+    root = notion_request("GET", f"https://api.notion.com/v1/pages/{NOTION_PAGE_ID}").json()
+    title = "".join(t.get("plain_text", t.get("text", {}).get("content", ""))
+                    for prop in root.get("properties", {}).values() if prop.get("type") == "title"
+                    for t in prop.get("title", []))
+    if title != "装修信息监控":
+        raise RuntimeError("Notion 主页名称不是装修信息监控，停止写入")
+    cursor = None
+    matches = []
+    while True:
+        params = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        data = notion_request("GET", f"https://api.notion.com/v1/blocks/{NOTION_PAGE_ID}/children", params=params).json()
+        matches.extend(b["id"] for b in data.get("results", []) if b.get("type") == "child_page"
+                       and b["child_page"].get("title") == str(run_date) and not b.get("archived"))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        if not cursor:
+            raise RuntimeError("子页面读取不完整，停止写入")
+    if len(matches) > 1:
+        raise RuntimeError("存在多个同名日期页，请先整理，避免写错页面")
+    if matches:
+        return matches[0]
+    data = notion_request("POST", "https://api.notion.com/v1/pages", json={
+        "parent": {"page_id": NOTION_PAGE_ID},
+        "properties": {"title": {"type": "title", "title": [{"type": "text", "text": {"content": str(run_date)}}]}}
+    }).json()
+    return data["id"]
+
+
 def update_notion(posts, run_date, target_dates):
+    global ACTIVE_DAILY_PAGE_ID
+    if datetime.now(LA_TIMEZONE).date() != run_date:
+        raise RuntimeError("已跨午夜，停止本轮写入")
+    posts = deduplicate_posts(posts)
+    if not validate_posts(posts, run_date, target_dates):
+        return False
+    ACTIVE_DAILY_PAGE_ID = ensure_daily_page(run_date)
+    try:
+        return replace_daily_content(posts, run_date, target_dates)
+    finally:
+        ACTIVE_DAILY_PAGE_ID = None
+
+
+def replace_daily_content(posts, run_date, target_dates):
     if not test_notion():
         log_message("Notion 不会被修改。")
         return False
@@ -1571,7 +1569,7 @@ def update_notion(posts, run_date, target_dates):
 
     try:
         log_message()
-        log_message("正在写入新的最近 3 天全部帖子结果...")
+        log_message("正在写入新的今天全部帖子结果...")
         created_ids = write_new_blocks(new_blocks)
 
         if len(created_ids) != len(new_blocks):
@@ -1632,7 +1630,7 @@ def update_notion(posts, run_date, target_dates):
 
     log_message()
     log_message("✅ Notion 最终验证通过")
-    log_message("✅ 最近 3 天全部帖子已写入")
+    log_message("✅ 今天全部帖子已写入")
     log_message("✅ 作者未写入")
     log_message("✅ 每条帖子可展开查看正文")
     log_message("✅ 旧数据残留 = 0")
@@ -1651,7 +1649,7 @@ def main():
 
     log_message()
     log_message("=" * 72)
-    log_message("ChineseInLA 装修 → Notion 最近 3 天全部帖子自动同步")
+    log_message("ChineseInLA 装修 → Notion 今天全部帖子自动同步")
     log_message("抓取全部帖子 / 不保存作者 / Toggle 展开正文")
     log_message("后台 requests 模式，不会弹浏览器")
     log_message("=" * 72)
@@ -1672,7 +1670,7 @@ def main():
     log_message(f"✅ Notion Token 已读取：{TOKEN_FILE.name}")
 
     try:
-        posts, run_started_at, target_dates = scrape_three_day_posts()
+        posts, run_started_at, target_dates = scrape_today_posts()
     except Exception as error:
         log_message()
         log_message("❌ 网页列表抓取失败：")
@@ -1702,7 +1700,7 @@ def main():
     if datetime.now(LA_TIMEZONE).date() != run_date:
         log_message()
         log_message("❌ 当前已经跨过午夜。")
-        log_message("3 天时间窗口已经变化，Notion 不会更新。")
+        log_message("当天日期已经变化，Notion 不会更新。")
         return False
 
     by_bucket = {
@@ -1714,9 +1712,7 @@ def main():
     log_message()
     log_message("准备同步到 Notion：")
     log_message(f"今天 {target_dates[0]}：{by_bucket['day0']} 条")
-    log_message(f"昨天 {target_dates[1]}：{by_bucket['day1']} 条")
-    log_message(f"前天 {target_dates[2]}：{by_bucket['day2']} 条")
-    log_message("3天合计：", len(posts), "条")
+    log_message("今天合计：", len(posts), "条")
 
     try:
         success = update_notion(
@@ -1742,9 +1738,7 @@ def main():
     log_message("=" * 72)
     log_message("全部完成")
     log_message(f"今天：{by_bucket['day0']} 条")
-    log_message(f"昨天：{by_bucket['day1']} 条")
-    log_message(f"前天：{by_bucket['day2']} 条")
-    log_message(f"3天合计：{len(posts)} 条")
+    log_message(f"今天合计：{len(posts)} 条")
     log_message("作者字段：不保存")
     log_message("正文：Notion Toggle 点击展开")
     log_message("浏览器弹窗：0")

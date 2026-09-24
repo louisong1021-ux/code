@@ -39,11 +39,11 @@ class ListingTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             app.find_main_window(rows, 2, None, True, 22)
 
-    def test_duplicate_urls_still_stop(self):
+    def test_duplicate_urls_allowed_for_latest_merge(self):
         rows = self.parse()
         rows[3]['url'] = rows[2]['url']
-        with self.assertRaises(RuntimeError):
-            app.find_main_window(rows, 2, None, True, 22)
+        selected, _ = app.find_main_window(rows, 2, None, True, 22)
+        self.assertEqual(len(selected), 15)
 
 
 if __name__ == '__main__':
