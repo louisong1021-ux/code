@@ -1754,45 +1754,34 @@ def request_stop(signum, frame):
     STOP_EVENT.set()
 
 
-def run_loop(once=False):
-    round_number = 0
-    while not STOP_EVENT.is_set():
-        round_number += 1
-        started = time.monotonic()
-        LOGGER.info("第 %s 轮开始", round_number)
-        try:
-            success = bool(main())
-        except Exception:
-            LOGGER.exception("本轮发生未处理异常；下轮将重试")
-            success = False
-        elapsed = time.monotonic() - started
-        LOGGER.log(logging.INFO if success else logging.ERROR,
-                   "第 %s 轮结束 | 状态=%s | 耗时=%.1f秒",
-                   round_number, "成功" if success else "失败", elapsed)
-        if once:
-            return 0 if success else 1
-        if STOP_EVENT.is_set():
-            break
-        delay = random.randint(55 * 60, 60 * 60)
-        next_run = datetime.now(LA_TIMEZONE) + timedelta(seconds=delay)
-        LOGGER.info("等待 %.1f 分钟；下次执行 %s", delay / 60, next_run.isoformat(timespec="seconds"))
-        STOP_EVENT.wait(delay)
-    LOGGER.info("已停止；当前同步已结束")
-    return 0
+def run_once():
+    if STOP_EVENT.is_set():
+        return 0
+    started = time.monotonic()
+    LOGGER.info("开始单次同步")
+    try:
+        success = bool(main())
+    except Exception:
+        LOGGER.exception("同步发生未处理异常；程序退出")
+        success = False
+    LOGGER.log(logging.INFO if success else logging.ERROR,
+               "同步结束 | 状态=%s | 耗时=%.1f秒",
+               "成功" if success else "失败", time.monotonic() - started)
+    return 0 if success else 1
 
 
 def cli():
-    parser = argparse.ArgumentParser(description="ChineseInLA 装修帖子持续同步至 Notion")
-    parser.add_argument("--once", action="store_true", help="只执行一轮后退出")
+    parser = argparse.ArgumentParser(description="ChineseInLA 装修帖子单次同步至 Notion")
+    parser.add_argument("--once", action="store_true", help="兼容旧命令；默认即为单次运行")
     parser.add_argument("--debug", action="store_true", help="记录分页识别及逐条抓取详情")
     args = parser.parse_args()
     configure_logging(args.debug)
     STOP_EVENT.clear()
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    LOGGER.info("启动：%s；日志时区 America/Los_Angeles", "单次模式" if args.once else "持续模式，每轮结束后等待55–60分钟")
+    LOGGER.info("启动：单次模式；日志时区 America/Los_Angeles")
     try:
-        return run_loop(args.once)
+        return run_once()
     finally:
         forum_session.close()
         notion_session.close()

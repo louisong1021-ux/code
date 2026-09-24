@@ -9,29 +9,16 @@ import chineseinla_renovation as app
 
 
 class RuntimeTests(unittest.TestCase):
-    def test_failure_and_exception_do_not_stop_loop(self):
-        event = threading.Event()
-        waits = []
-
-        def wait(seconds):
-            waits.append(seconds)
-            if len(waits) == 3:
-                event.set()
-
-        with patch.object(app, "STOP_EVENT", event), \
-                patch.object(event, "wait", side_effect=wait), \
-                patch.object(app, "main", side_effect=[False, RuntimeError("test failure"), True]) as run, \
-                patch.object(app.random, "randint", return_value=3400) as interval:
-            self.assertEqual(app.run_loop(), 0)
-            self.assertEqual(run.call_count, 3)
-            self.assertEqual(waits, [3400] * 3)
-            interval.assert_called_with(3300, 3600)
+    def test_exception_exits_without_retry(self):
+        with patch.object(app, "STOP_EVENT", threading.Event()), patch.object(app, "main", side_effect=RuntimeError("test failure")) as run:
+            self.assertEqual(app.run_once(), 1)
+            run.assert_called_once()
 
     def test_once_exit_status(self):
         for success, status in ((True, 0), (False, 1)):
             with patch.object(app, "STOP_EVENT", threading.Event()), \
                     patch.object(app, "main", return_value=success):
-                self.assertEqual(app.run_loop(once=True), status)
+                self.assertEqual(app.run_once(), status)
 
     def test_stop_finishes_round_without_another_wait(self):
         event = threading.Event()
@@ -43,7 +30,7 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(app, "STOP_EVENT", event), \
                 patch.object(app, "main", side_effect=run), \
                 patch.object(event, "wait") as wait:
-            self.assertEqual(app.run_loop(), 0)
+            self.assertEqual(app.run_once(), 0)
             wait.assert_not_called()
 
     def test_log_redaction_and_rotation(self):

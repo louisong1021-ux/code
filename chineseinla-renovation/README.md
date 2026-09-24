@@ -1,7 +1,7 @@
 # 装修当天监控
 
 - 按洛杉矶时区抓取当天的普通装修帖子，遇到昨天或更早的列表内容即停止翻页；保留现有广告和置顶排除规则。
-- 默认每轮结束后随机等待 55–60 分钟。
+- 默认只执行一轮，成功或失败后立即退出，不循环、不自动重试。成功退出码为 0，失败为 1；`--once` 仅作为兼容参数保留。
 - 验证 Notion 父页面名为「装修信息监控」，查找 `YYYY-MM-DD` 子页面；不存在时创建，存在时复用。
 - 仅更新当天子页面，父页面和其他日期页面不参与清理。
 - 按帖子 ID 去重，同一 ID 采用时间最新的记录；保留其首次出现的网站位置，不按时间重新排序。
@@ -18,7 +18,7 @@ python -B -m unittest discover -s chineseinla-renovation -p "test_*.py"
 手动执行一轮（会写入 Notion）：
 
 ```powershell
-python chineseinla_renovation.py --once
+python chineseinla_renovation.py
 ```
 
 凭据沿用原来的 `notion_token.txt` 或环境变量，不上传凭据到仓库。
