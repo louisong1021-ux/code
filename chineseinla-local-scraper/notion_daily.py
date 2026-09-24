@@ -6,11 +6,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
-import hashlib
 import json
-import os
 import re
 import uuid
 
@@ -265,14 +262,14 @@ def complete_markdown(result):
 
 
 class DailySync:
-    """Read, merge, back up, batch-save and verify the complete daily list.
+    """Read, merge, batch-save and verify the complete daily list.
 
     The extra preflight GET detects an old concurrently running writer. Notion has
     no conditional-write token here: stop other writers before enabling this code.
     """
-    def __init__(self, request, page_id, target, backup_dir, log, guard=lambda: None):
+    def __init__(self, request, page_id, target, log, guard=lambda: None):
         self.request, self.page_id, self.target = request, page_id, target
-        self.backup_dir, self.log, self.guard = Path(backup_dir), log, guard
+        self.log, self.guard = log, guard
 
     def save(self, rows, *, successful_scan=True, now=None, apply=True):
         self.guard()
@@ -290,14 +287,8 @@ class DailySync:
             raise RuntimeError("生成内容校验失败，未提交任何修改")
         payload = {"type": "replace_content", "replace_content": {"new_str": new_markdown}}
         chunks = split_batches(new_markdown)
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        backup = self.backup_dir / f"{self.page_id}-{now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}.json"
-        fd = os.open(str(backup), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"page_id": self.page_id, "before": old_markdown, "after": new_markdown,
-                       "before_sha256": hashlib.sha256(old_markdown.encode()).hexdigest()}, stream, ensure_ascii=False)
         report = {**counts, **statistics(state, self.target), "legacy_duplicates": state.duplicates,
-                  "last_success": state.last_success, "backup": str(backup),
+                  "last_success": state.last_success, 
                   "status": "preview", "page_id": self.page_id}
         if not apply:
             return report
@@ -315,9 +306,9 @@ class DailySync:
             expected_order = [p.row["帖子ID"] for p in sorted_posts(state)]
             if (saved.posts != state.posts or saved.duplicates or saved.order != expected_order
                     or saved.last_success != state.last_success):
-                raise RuntimeError("Notion 返回内容与提交结果不一致；不能判定成功，请检查备份")
+                raise RuntimeError("Notion 返回内容与提交结果不一致；不能判定成功，请重新读取 Notion 页面确认")
         except Exception as exc:
-            self.log("Notion错误", f"本轮提交失败或结果未确认：{type(exc).__name__}: {exc}；备份={backup}")
+            self.log("Notion错误", f"本轮提交失败或结果未确认：{type(exc).__name__}: {exc}")
             raise
         report["status"] = "success" if successful_scan else "partial"
         for kind, pid, old, new, count in events:

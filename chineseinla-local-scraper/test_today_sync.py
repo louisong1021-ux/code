@@ -45,8 +45,7 @@ class TodaySyncTests(unittest.TestCase):
                 patch.object(app, "extract_topic_links", return_value=[pinned, old]), \
                 patch.object(app, "process_topic", side_effect=[(pinned, "求职"), (old, "招聘")]), \
                 patch.object(app, "type_allowed", return_value=False), \
-                patch.object(app, "ensure_csv_header"), patch.object(app, "append_csv_row"), \
-                patch.object(app, "_log"), patch.object(app, "_log_captured_row"):
+                                patch.object(app, "_log"), patch.object(app, "_log_captured_row"):
             rows, stats = app.crawl_live(today)
         self.assertEqual(rows, [pinned])
         self.assertEqual(stats["stop_reason"], "target_date_boundary")
@@ -115,7 +114,6 @@ class TodaySyncTests(unittest.TestCase):
         for error in (ValueError("invalid date"), RuntimeError("page denied"),
                       app.requests.Timeout("timeout")):
             with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory, \
-                    patch.object(app, "RESULT_JSON", Path(directory) / "result.json"), \
                     patch.object(app, "read_date_page", side_effect=error), \
                     patch.object(app, "NotionWriter") as factory, \
                     patch.object(app, "crawl_live", return_value=([], {})) as crawl, \
@@ -135,11 +133,10 @@ class TodaySyncTests(unittest.TestCase):
     def test_empty_parameter_uses_today_without_reading_page(self):
         for value in (None, "", "  "):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory, \
-                    patch.object(app, "RESULT_JSON", Path(directory) / "result.json"), \
                     patch.object(app, "read_date_page") as read, \
                     patch.object(app, "crawl_live", return_value=([], {})) as crawl, \
                     patch("builtins.print"):
-                result = app.run(date_page=value, local_only=True)
+                result = app.run(date_page=value, dry_run=True)
                 read.assert_not_called()
                 crawl.assert_called_once_with(app.datetime.now(app.LA_TZ).date(), None)
                 self.assertFalse(result["date_parameter_fallback"])
@@ -169,7 +166,6 @@ class TodaySyncTests(unittest.TestCase):
     def test_historical_date_propagates_through_run(self):
         target = date(2025, 1, 2)
         with tempfile.TemporaryDirectory() as directory, \
-                patch.object(app, "RESULT_JSON", Path(directory) / "result.json"), \
                 patch.object(app, "read_date_page", return_value=target), \
                 patch.object(app, "NotionWriter") as factory, \
                 patch.object(app, "crawl_live", return_value=([], {})) as crawl, \
@@ -232,14 +228,11 @@ class TodaySyncTests(unittest.TestCase):
                 patch.object(app, "extract_topic_links", side_effect=[items] + [[]] * 20), \
                 patch.object(app, "process_topic", side_effect=[(r, "招聘") for r in rows]), \
                 patch.object(app, "type_allowed", return_value=True), \
-                patch.object(app, "ensure_csv_header"), \
-                patch.object(app, "append_csv_row") as csv, \
                 patch.object(app, "_log"), patch.object(app, "_log_captured_row"):
             result, stats = app.crawl_live(today, writer)
         self.assertEqual(result, rows[1:])
         self.assertEqual(stats["date_skipped"], 1)
         self.assertEqual(writer.write.call_count, 2)
-        self.assertEqual(csv.call_count, 2)
 
     def test_notion_buffers_daily_content_and_checks_date(self):
         today = app.datetime.now(app.LA_TZ).date()

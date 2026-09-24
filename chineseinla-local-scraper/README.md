@@ -25,7 +25,7 @@ python ChineseInLA_local_scraper_cli.py
 Token 需要读取参数页面、读取招聘信息监控、创建日期子页面及更新内容的权限。
 
 只执行一轮：`python ChineseInLA_local_scraper_cli.py --once`。
-只保存 CSV（仍读取参数）：`python ChineseInLA_local_scraper_cli.py --local-only --once`。
+实时测试且不保存数据（仍读取参数）：`python -B ChineseInLA_local_scraper_cli.py --dry-run --once`。旧参数 `--local-only` 作为 `--dry-run` 的别名保留，不再保存 CSV。
 
 兼容旧参数：`--date-page "Notion页面链接或ID"` 从该页面标题读取唯一日期，优先覆盖参数页面的日期。
 读取失败则静默回退当天。标题支持 `2026-09-22`、`2026/9/22`、`2026年9月22日`。
@@ -38,7 +38,7 @@ Token 需要读取参数页面、读取招聘信息监控、创建日期子页�
 
 普通帖写入“招聘信息监控”下的 `YYYY-MM-DD` 子页面；置顶帖写入同级“置顶”子页面。置顶帖不受日期和招聘类型限制，识别为置顶即收录；普通帖仍要求发布或刷新日期符合目标日期且类型为招聘。每日子页面存在则按帖子ID合并；置顶页沿用既有追加行为。
 每日页保留此前采集的帖子，同ID重复运行不会追加副本；完整空轮次可以更新统计，失败且无结果的轮次不提交。
-CSV 保存本轮原始采集记录，每日 Notion 列表在扫描后统一合并提交。默认当天模式跨午夜停止本轮写入，下轮重新计算当天；指定日期模式保持指定日期。
+采集结果仅暂存在内存，每日 Notion 列表在扫描后统一合并提交。不读取旧 CSV/JSON，不生成 CSV、results.json、本地备份或日志文件；日志输出到终端。使用 `python -B` 可同时禁止 Python 字节码缓存。已有凭据文件仍可用于读取 Notion token，历史采集文件不会自动删除。默认当天模式跨午夜停止本轮写入，下轮重新计算当天；指定日期模式保持指定日期。
 若 Token 或写入权限失效，无法完成写入，但程序会等待后继续下一轮。
 
 验证（不访问网络、不写 Notion）：`python -m unittest -v test_today_sync`。
@@ -46,7 +46,7 @@ CSV 保存本轮原始采集记录，每日 Notion 列表在扫描后统一合�
 ## 每日列表去重与刷新计数
 
 `NotionWriter.write()` 缓存普通帖子，`finish()` 在扫描结束后调用 `notion_daily.DailySync`。
-分页、网站详情、字段提取、CSV、参数和随机等待逻辑不变。置顶页仍按既有规则独立处理，本次不迁移或整理置顶页。
+分页、网站详情、字段提取、参数和随机等待逻辑不变。置顶页仍按既有规则独立处理，本次不迁移或整理置顶页。
 
 每日页通过帖子ID恢复已有记录和重新发布次数。相同有效时间重复扫描不增加次数；只有有效时间变化才增加，时间格式中的逗号、斜杠和 AM/PM 会先标准化。新帖子计数为零。新字段为空/None/null/未采集时保留已有有效值。
 
@@ -58,7 +58,7 @@ CSV 保存本轮原始采集记录，每日 Notion 列表在扫描后统一合�
 ### 保存边界
 
 - 小页面为 1 次全文读取 + 1 次提交前复查 + 1 次批量更新；大页面按完整帖子分批（每批最多90条，约300KB），不逐帖子查询。
-- 根据完整旧内容生成新内容并检查帖子ID集合，保存 `notion_backups/` 下的前后备份后再更新。
+- 根据完整旧内容生成新内容并检查帖子ID集合，只在内存中保留本轮内容后更新，不生成本地备份。
 - 小页面使用 Notion Markdown `replace_content` 提交完整合并结果；大页面先保留旧列表、写入暂存边界和全部新批次，验证所有字段、顺序及次数后移除旧展示。内部 block ID 可能变化，帖子ID和数据保留。
 - 提交前发现页面被另一个进程修改则取消。Notion 此接口没有条件写入事务，因此启用前必须先停掉旧版写入进程；不要同时手动修改同一日期页。
 - 页面截断、未知块、非脚本内容、解析失败均停止提交。不会以缺失数据覆盖旧数据。
@@ -75,7 +75,7 @@ CSV 保存本轮原始采集记录，每日 Notion 列表在扫描后统一合�
 python -m unittest discover -p "test_*.py" -v
 ```
 
-真实小规模抓取最多读取首页 5 条普通帖详情，复用现有提取函数，默认只写本地 JSON/Markdown：
+真实小规模抓取最多读取首页 5 条普通帖详情，复用现有提取函数，默认仅在内存中处理并输出统计，不写本地文件或 Notion：
 
 ```powershell
 python small_notion_test.py --limit 5
@@ -84,11 +84,11 @@ python small_notion_test.py --limit 5
 确认样本后，在 Notion 手工准备一个空白专用测试页，标题必须为 `招聘信息监控测试 · YYYY-MM-DD`（日期与测试目标一致），并授权现有集成。使用原来的 token 配置。以下 `<测试页ID>` 必须替换，不能使用正式日期页：
 
 ```powershell
-python small_notion_test.py --input small_test_rows.json --test-page <测试页ID>
-python small_notion_test.py --input small_test_rows.json --test-page <测试页ID> --apply
+python -B small_notion_test.py --limit 5 --test-page <测试页ID>
+python -B small_notion_test.py --limit 5 --test-page <测试页ID> --apply
 ```
 
-第一条只读取并生成备份/预览；第二条明确写入测试页。再次执行第二条，相同帖子应仍只有一条，次数不增加。跨日重放样本时请增加 `--date YYYY-MM-DD`。
+两条命令均实时抓取，不读取本地样本。第一条只读取 Notion 并在内存中预览；第二条明确写入测试页。相同帖子且刷新时间不变时仍只有一条，次数不增加。
 
 本次不要直接执行主脚本的 `--once` 做小规模测试，它仍然会按原分页规则执行完整一轮。
 

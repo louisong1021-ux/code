@@ -157,7 +157,16 @@ class SaveTests(unittest.TestCase):
         self.log = Mock()
 
     def sync(self, fake, guard=lambda: None):
-        return d.DailySync(fake, 'test-page', DAY, self.temp.name, self.log, guard)
+        return d.DailySync(fake, 'test-page', DAY, self.log, guard)
+
+    def test_no_local_files_for_save_or_preview(self):
+        fake = FakeNotion()
+        with patch('builtins.open', side_effect=AssertionError('File writes forbidden')), patch.object(Path, 'mkdir', side_effect=AssertionError('Directory creation forbidden')), patch.object(Path, 'write_text', side_effect=AssertionError('File writes forbidden')):
+            self.sync(fake).save([row()], now=NOW, apply=False)
+            self.sync(fake).save([row()], now=NOW)
+            with patch.object(app, '_log'), patch.object(app, 'crawl_live', return_value=([row()], {'written': 1, 'stop_reason': 'forum_end'})), patch('builtins.print'):
+                result = app.run(dry_run=True)
+            self.assertEqual(result['storage'], 'memory_only')
 
     def test_300_posts_constant_api_calls_and_idempotence(self):
         fake = FakeNotion()
@@ -166,7 +175,8 @@ class SaveTests(unittest.TestCase):
         self.assertEqual(report['total'], 300)
         self.assertLess(len(fake.calls), 12)
         self.assertNotIn('CHINESEINLASYNC', fake.markdown)
-        self.assertTrue(Path(report['backup']).exists())
+        self.assertNotIn('backup', report)
+        self.assertEqual(list(Path(self.temp.name).iterdir()), [])
         fake.calls.clear()
         report = self.sync(fake).save(rows, now=NOW)
         self.assertEqual(report['new'], 0)

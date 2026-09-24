@@ -2,7 +2,7 @@
 ChineseInLA 招聘采集：收录目标日期刷新或发布的帖子；默认洛杉矶当天。
 
 依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是目标日期即收录。
-默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，按帖子ID合并；保留本地 CSV 和已有帖子。
+默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，按帖子ID合并；仅在 Notion 保存帖子，不保存本地采集文件。
 每轮读取 Notion 参数页的间隔和日期，持续循环；保持类型筛选、网页顺序，本页普通帖子均早于目标日期时停止翻页。
 每日页面去重、记录真实刷新次数并按最新时间排序；置顶页保留既有行为。
 默认当天模式跨午夜停止写入；--date-page 指定日期模式始终使用参数日期。
@@ -14,7 +14,6 @@ ChineseInLA 招聘采集：收录目标日期刷新或发布的帖子；默认�
 from __future__ import annotations
 
 import argparse
-import csv
 import html as html_std
 import json
 import math
@@ -113,7 +112,7 @@ JOB_TYPE_FILTER = os.environ.get(
 # 默认保留置顶帖；置顶帖和普通帖都按网页出现顺序写入本地。
 SKIP_PINNED = False
 
-# 本地 CSV 顺序固定为：网页按什么顺序抓到，就按什么顺序追加写入。
+# 采集结果暂存在内存，扫描结束后合并到 Notion。
 # 不按刷新时间或其他字段做二次排序。
 
 # 请求间隔，避免过快访问网站
@@ -455,7 +454,7 @@ class NotionWriter:
             _log("Notion", self.daily_report["reason"])
             return
         sync = DailySync(self.request, self.ensure_daily_page(), self.target,
-                         BASE_DIR / "notion_backups", _log, self.guard_date)
+                         _log, self.guard_date)
         try:
             self.daily_report = sync.save(self.pending_daily, successful_scan=complete)
         except Exception as exc:
@@ -465,15 +464,6 @@ class NotionWriter:
 
     def close(self):
         self.session.close()
-
-OUTPUT_CSV = (
-    BASE_DIR
-    / "ChineseInLA_local_posts.csv"
-)
-RESULT_JSON = (
-    BASE_DIR
-    / "results.json"
-)
 
 # 采集停止信号。
 # 纯命令行版主要通过 Ctrl+C 终止；保留该事件以兼容现有抓取循环中的停止检查。
@@ -1406,8 +1396,8 @@ def extract_topic_links(
             "标题":
                 title,
 
-            # 仅用于折叠标题显示和 CSV 留档；
-            # 本地 CSV 通过“置顶”字段保存该状态。
+            # 仅用于折叠标题显示；
+            # “置顶”字段保留该状态。
             "置顶":
                 ("是" if is_pinned else ""),
 
@@ -2239,54 +2229,7 @@ def process_topic(
 
 
 # ============================================================
-# 本地 CSV / 运行结果
-# ============================================================
-
-def ensure_csv_header() -> None:
-    """确保 CSV 存在并包含表头；不会清空已有数据。"""
-    if OUTPUT_CSV.exists() and OUTPUT_CSV.stat().st_size > 0:
-        return
-
-    with OUTPUT_CSV.open(
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    ) as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=OUTPUT_FIELDS,
-        )
-        writer.writeheader()
-
-
-def append_csv_row(row: dict[str, str]) -> None:
-    """
-    立即把一条记录追加到本地 CSV。
-
-    不做任何去重；调用顺序就是 CSV 中的保存顺序。
-    """
-    ensure_csv_header()
-
-    with OUTPUT_CSV.open(
-        "a",
-        encoding="utf-8-sig",
-        newline="",
-    ) as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=OUTPUT_FIELDS,
-        )
-        writer.writerow(
-            {
-                field: row.get(field, "")
-                for field in OUTPUT_FIELDS
-            }
-        )
-        f.flush()
-
-
-# ============================================================
-# 实时抓取：纯本地、无历史去重
+# 实时采集
 # ============================================================
 
 def _log(tag: str, message: str) -> None:
@@ -2382,7 +2325,6 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
     stop_reason = ""
     seen_page_signatures: set[tuple[str, ...]] = set()
 
-    ensure_csv_header()
 
     while not STOP_EVENT.is_set():
         url = page_url(page)
@@ -2436,7 +2378,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
             continue
 
         # 只用于避免分页地址异常时无限重复同一整页。
-        # 不会过滤页内帖子，也不会与历史 CSV 比较。
+        # 不会过滤页内帖子，也不读取历史本地数据。
         page_signature = tuple(clean(item.get("帖子ID")) for item in topics)
         if page_signature in seen_page_signatures:
             stop_reason = "repeated_page"
@@ -2522,10 +2464,9 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
                 row["置顶"] = ""
                 stats["normal_found"] = int(stats["normal_found"]) + 1
 
-            # 日期页先缓存，扫描结束后统一提交；CSV 仍保存原始采集结果。
+            # 日期页先在内存缓存，扫描结束后统一提交。
             if writer is not None:
                 writer.write(row)
-            append_csv_row(row)
             rows.append(row)
             stats["written"] = int(stats["written"]) + 1
             page_written += 1
@@ -2560,7 +2501,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
 # 主程序
 # ============================================================
 
-def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = None, configured_date=None) -> dict:
+def run(*, clear_stop: bool = True, dry_run: bool = False, date_page: str = None, configured_date=None) -> dict:
     """抓取参数页面日期或洛杉矶当天的记录，写入日期子页面。"""
     if clear_stop:
         STOP_EVENT.clear()
@@ -2583,7 +2524,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
     started_perf = time.perf_counter()
 
     print("=" * 76)
-    _log("开始", "ChineseInLA 招聘采集 | 指定日期刷新或发布 | " + ("仅本地 CSV" if local_only else "Notion + CSV"))
+    _log("开始", "ChineseInLA 招聘采集 | 指定日期刷新或发布 | " + ("仅内存测试" if dry_run else "仅保存到 Notion"))
     _log("日期", f"{target_date} | America/Los_Angeles")
     _log("配置", f"类型={JOB_TYPE_FILTER} | 跳过置顶={'是' if SKIP_PINNED else '否'}")
     _log(
@@ -2591,11 +2532,11 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         f"请求间隔={REQUEST_DELAY_MIN_SECONDS:g}-{REQUEST_DELAY_MAX_SECONDS:g} 秒 | "
         f"超时={REQUEST_TIMEOUT_SECONDS} 秒",
     )
-    _log("保存", f"CSV：{OUTPUT_CSV}")
+    _log("保存", "不生成本地采集文件；" + ("测试模式不写入 Notion" if dry_run else "数据仅保存到 Notion"))
     _log("规则", "每日页按帖子ID合并、最新时间排序；完整扫描后更新最后成功时间")
     print("=" * 76)
 
-    writer = None if local_only else NotionWriter(target_date, guard_midnight=not explicit_date)
+    writer = None if dry_run else NotionWriter(target_date, guard_midnight=not explicit_date)
     try:
         if writer is not None:
             writer.check_page()
@@ -2628,7 +2569,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         "target_date": str(target_date),
         "date_source_page_id": source_page_id,
         "date_parameter_fallback": date_fallback,
-        "notion_page_id": None if local_only else NOTION_PAGE_ID,
+        "notion_page_id": None if dry_run else NOTION_PAGE_ID,
         "notion_daily_page_id": None if writer is None else writer.daily_page_id,
         "notion_written": 0 if writer is None else writer.count,
         "run_started_at": run_started_at.isoformat(timespec="seconds"),
@@ -2641,21 +2582,16 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         "forum_id": FORUM_ID,
         "job_type_filter": JOB_TYPE_FILTER,
         "skip_pinned": SKIP_PINNED,
-        "storage": "local_csv_append" if local_only else "notion_daily_merge_and_csv_append",
+        "storage": "memory_only" if dry_run else "notion_daily_merge",
         "notion_daily_summary": None if writer is None else writer.daily_report,
-        "display_order": "forum_order" if local_only else "latest_time_desc",
+        "display_order": "forum_order" if dry_run else "latest_time_desc",
         "written_rows": written,
         "valid_rows": written,
         "speed_rows_per_minute": round(speed_per_minute, 2),
         "stopped_by_user": stop_reason == "user_stop",
         "stats": stats,
-        "csv": str(OUTPUT_CSV),
     }
 
-    RESULT_JSON.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
     print()
     print("=" * 76)
@@ -2680,8 +2616,6 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
     print(f"详情失败    ：{int(stats.get('detail_failed', 0))} 条")
     print(f"列表失败    ：{int(stats.get('list_failed', 0))} 页")
     print(f"平均速度    ：{speed_per_minute:.1f} 条/分钟")
-    print(f"CSV 文件    ：{OUTPUT_CSV}")
-    print(f"运行报告    ：{RESULT_JSON}")
     if writer is not None and writer.daily_report:
         report = writer.daily_report
         print("========== 每日列表合并结果 ==========")
@@ -2697,13 +2631,13 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
 
     return result
 
-def run_continuously(*, local_only=False, date_page=None, once=False):
+def run_continuously(*, dry_run=False, date_page=None, once=False):
     STOP_EVENT.clear()
     while not STOP_EVENT.is_set():
         interval, target = read_parameters()
         _log("参数", f"日期={target or '当天'} | 循环间隔={interval / 60:g} 分钟")
         try:
-            run(clear_stop=False, local_only=local_only, date_page=date_page, configured_date=target)
+            run(clear_stop=False, dry_run=dry_run, date_page=date_page, configured_date=target)
         except Exception:
             _log("状态", "本轮未完成")
             if once:
@@ -2718,12 +2652,12 @@ def run_continuously(*, local_only=False, date_page=None, once=False):
 def run_cli() -> None:
     """默认持续运行，每轮读取参数页面。"""
     parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新或发布的招聘信息并合并到 Notion 每日列表")
-    parser.add_argument("--local-only", action="store_true", help="仅保存 CSV，不写 Notion；仍读取参数页面")
+    parser.add_argument("--dry-run", "--local-only", dest="dry_run", action="store_true", help="实时采集到内存，不写 Notion 或本地文件；仍读取参数页面")
     parser.add_argument("--date-page", metavar="URL_OR_ID", help="读取指定 Notion 页面标题中的日期；不传则使用参数页面日期")
     parser.add_argument("--once", action="store_true", help="读取参数后只执行一轮")
     args = parser.parse_args()
     try:
-        raise SystemExit(run_continuously(local_only=args.local_only, date_page=args.date_page, once=args.once))
+        raise SystemExit(run_continuously(dry_run=args.dry_run, date_page=args.date_page, once=args.once))
     except KeyboardInterrupt:
         STOP_EVENT.set()
         print("\n用户中止。")
