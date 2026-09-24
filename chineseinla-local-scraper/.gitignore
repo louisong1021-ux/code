@@ -1,2 +1,6 @@
 ChineseInLA_local_posts.csv
 results.json
+
+notion_backups/
+small_test_*.json
+small_test_*.md

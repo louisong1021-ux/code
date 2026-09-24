@@ -2,9 +2,9 @@
 ChineseInLA 招聘采集：收录目标日期刷新或发布的帖子；默认洛杉矶当天。
 
 依据桌面详情页 div.post_time 的“更新于”或“发布于”日期筛选，任意一个是目标日期即收录。
-默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，逐条追加；保留本地 CSV 和旧内容。
+默认在 Notion“招聘信息监控”下创建或复用 YYYY-MM-DD 日期子页面，按帖子ID合并；保留本地 CSV 和已有帖子。
 每轮读取 Notion 参数页的间隔和日期，持续循环；保持类型筛选、网页顺序，本页普通帖子均早于目标日期时停止翻页。
-重复运行可能重复追加。两个日期均非目标日期或无效的帖子跳过。
+每日页面去重、记录真实刷新次数并按最新时间排序；置顶页保留既有行为。
 默认当天模式跨午夜停止写入；--date-page 指定日期模式始终使用参数日期。
 
 依赖：pip install requests lxml tzdata
@@ -24,6 +24,7 @@ import re
 import time
 import threading
 import uuid
+from notion_daily import DailySync
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -353,7 +354,7 @@ def read_date_page(value: str) -> date:
 
 
 class NotionWriter:
-    """追加本轮结果，不删除页面现有内容。写入不自动重试以免重复追加。"""
+    """每日帖子缓存在内存，扫描后合并提交；置顶页保持现有路由。"""
     def __init__(self, target: date, guard_midnight=True):
         self.target = target
         self.guard_midnight = guard_midnight
@@ -362,11 +363,15 @@ class NotionWriter:
         self.daily_page_id = None
         self.pinned_page_id = None
         self.started_pages = set()
+        self.pending_daily = []
+        self.daily_report = None
         self.session = requests.Session()
         self.session.headers.update({"Authorization": "Bearer " + load_notion_token(),
                                      "Notion-Version": "2026-03-11", "Content-Type": "application/json"})
 
     def request(self, method, path, **kwargs):
+        if "json" in kwargs:
+            kwargs["data"] = json.dumps(kwargs.pop("json"), ensure_ascii=False).encode("utf-8")
         response = self.session.request(method, "https://api.notion.com/v1/" + path,
                                         timeout=45, **kwargs)
         if not response.ok:
@@ -418,13 +423,19 @@ class NotionWriter:
         _log("Notion", f"子页面：{title} | {page_id}")
         return page_id
 
-    def write(self, row):
+    def guard_date(self):
         if self.guard_midnight and datetime.now(LA_TZ).date() != self.started_date:
             raise RuntimeError("已跨过洛杉矶午夜，停止写入；请重新运行以抓取新的一天")
+
+    def write(self, row):
+        self.guard_date()
         is_pinned = clean(row.get("置顶")) == "是"
         if not is_pinned and not matches_day(row, self.target):
             raise ValueError("拒绝写入非目标日期刷新或发布的帖子")
-        page_id = self.ensure_pinned_page() if is_pinned else self.ensure_daily_page()
+        if not is_pinned:
+            self.pending_daily.append(dict(row))
+            return
+        page_id = self.ensure_pinned_page()
         blocks = [recruitment_block(row)]
         if page_id not in self.started_pages:
             blocks.insert(0, {"object": "block", "type": "heading_2", "heading_2": {
@@ -434,6 +445,23 @@ class NotionWriter:
             raise RuntimeError("Notion 返回的写入数量不符，请检查页面后再重试")
         self.count += 1
         self.started_pages.add(page_id)
+
+    def finish(self, stats):
+        self.guard_date()
+        complete = (not stats.get("list_failed") and not stats.get("detail_failed")
+                    and stats.get("stop_reason") in {"target_date_boundary", "forum_end"})
+        if not self.pending_daily and not complete:
+            self.daily_report = {"status": "skipped", "reason": "采集未完成且无可合并帖子"}
+            _log("Notion", self.daily_report["reason"])
+            return
+        sync = DailySync(self.request, self.ensure_daily_page(), self.target,
+                         BASE_DIR / "notion_backups", _log, self.guard_date)
+        try:
+            self.daily_report = sync.save(self.pending_daily, successful_scan=complete)
+        except Exception as exc:
+            _log("Notion错误", f"每日列表更新失败：{type(exc).__name__}: {exc}")
+            raise
+        self.count += len({r["帖子ID"] for r in self.pending_daily})
 
     def close(self):
         self.session.close()
@@ -2325,9 +2353,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
 
     日志原则：
     - 页面：输出开始/完成摘要；
-    - 成功：每条帖子逐字段报告实际采集内容；
-    - 正文：不输出正文内容，只报告“已采集 / 未采集”；
-    - 空字段：统一显示“未采集”；
+    - 合并：每日列表提交后输出 NEW/REFRESH 和统计，不逐条打印字段或正文；
     - 跳过/失败：单独标记，便于搜索；
     - 结束：由 run() 输出统一运行报告。
     """
@@ -2496,7 +2522,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
                 row["置顶"] = ""
                 stats["normal_found"] = int(stats["normal_found"]) + 1
 
-            # 先确认 Notion 写入成功，再计入本地成功记录；失败时停止，保留已写入结果。
+            # 日期页先缓存，扫描结束后统一提交；CSV 仍保存原始采集结果。
             if writer is not None:
                 writer.write(row)
             append_csv_row(row)
@@ -2504,10 +2530,7 @@ def crawl_live(target_date=None, writer=None) -> tuple[list[dict[str, str]], dic
             stats["written"] = int(stats["written"]) + 1
             page_written += 1
 
-            _log_captured_row(
-                row,
-                sequence=int(stats["written"]),
-            )
+            # 每轮由 Notion 合并阶段输出 NEW/REFRESH 和汇总；不逐条刷屏。
 
         _log(
             "页面完成",
@@ -2569,7 +2592,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         f"超时={REQUEST_TIMEOUT_SECONDS} 秒",
     )
     _log("保存", f"CSV：{OUTPUT_CSV}")
-    _log("规则", "不读取历史、不去重、按网页顺序、每条成功后立即写入")
+    _log("规则", "每日页按帖子ID合并、最新时间排序；完整扫描后更新最后成功时间")
     print("=" * 76)
 
     writer = None if local_only else NotionWriter(target_date, guard_midnight=not explicit_date)
@@ -2577,6 +2600,8 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         if writer is not None:
             writer.check_page()
         rows, stats = crawl_live(target_date, writer)
+        if writer is not None:
+            writer.finish(stats)
     finally:
         if writer is not None:
             writer.close()
@@ -2616,8 +2641,9 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
         "forum_id": FORUM_ID,
         "job_type_filter": JOB_TYPE_FILTER,
         "skip_pinned": SKIP_PINNED,
-        "storage": "local_csv_append" if local_only else "notion_and_csv_append",
-        "display_order": "forum_order",
+        "storage": "local_csv_append" if local_only else "notion_daily_merge_and_csv_append",
+        "notion_daily_summary": None if writer is None else writer.daily_report,
+        "display_order": "forum_order" if local_only else "latest_time_desc",
         "written_rows": written,
         "valid_rows": written,
         "speed_rows_per_minute": round(speed_per_minute, 2),
@@ -2642,7 +2668,7 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
     print(f"运行耗时    ：{_format_duration(elapsed_seconds)}")
     print(f"扫描页数    ：{pages} 页")
     print(f"列表帖子    ：{int(stats.get('topics_seen', 0))} 条")
-    print(f"成功写入    ：{written} 条")
+    print(f"本轮采集    ：{written} 条（Notion 状态见下方）")
     print(
         f"  普通帖子  ：{int(stats.get('normal_found', 0))} 条\n"
         f"  置顶帖子  ：{int(stats.get('pinned_found', 0))} 条"
@@ -2656,6 +2682,17 @@ def run(*, clear_stop: bool = True, local_only: bool = False, date_page: str = N
     print(f"平均速度    ：{speed_per_minute:.1f} 条/分钟")
     print(f"CSV 文件    ：{OUTPUT_CSV}")
     print(f"运行报告    ：{RESULT_JSON}")
+    if writer is not None and writer.daily_report:
+        report = writer.daily_report
+        print("========== 每日列表合并结果 ==========")
+        for label, key in (("新增帖子", "new"), ("字段有更新", "updated"),
+                           ("重复但时间未变化", "unchanged_time"), ("发生重新发布", "refreshed"),
+                           ("今日去重帖子总数", "total"), ("今日新发布", "published_today"),
+                           ("重新发布过", "reposted"), ("有邮箱", "email"), ("有电话", "phone")):
+            print(f"{label}：{report.get(key, 0)}")
+        print(f"Notion页面：{target_date}")
+        print(f"Notion更新：{report['status']}")
+        print(f"最后成功更新时间：{report.get('last_success', '未更新')}")
     print("=" * 76)
 
     return result
@@ -2680,7 +2717,7 @@ def run_continuously(*, local_only=False, date_page=None, once=False):
 
 def run_cli() -> None:
     """默认持续运行，每轮读取参数页面。"""
-    parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新或发布的招聘信息并追加到 Notion")
+    parser = argparse.ArgumentParser(description="抓取洛杉矶当天刷新或发布的招聘信息并合并到 Notion 每日列表")
     parser.add_argument("--local-only", action="store_true", help="仅保存 CSV，不写 Notion；仍读取参数页面")
     parser.add_argument("--date-page", metavar="URL_OR_ID", help="读取指定 Notion 页面标题中的日期；不传则使用参数页面日期")
     parser.add_argument("--once", action="store_true", help="读取参数后只执行一轮")

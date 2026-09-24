@@ -14,14 +14,15 @@ class TodaySyncTests(unittest.TestCase):
             writer = app.NotionWriter(today)
         writer.pinned_page_id = "pinned"
         writer.daily_page_id = "daily"
-        writer.request = Mock(side_effect=[{"results": [{}, {}]}, {"results": [{}, {}]}, {"results": [{}]}])
+        writer.request = Mock(side_effect=[{"results": [{}, {}]}, {"results": [{}]}])
         row = {"标题": "招聘", "发布时间": str(today), "详情URL": "https://example.com/job"}
         writer.write({**row, "置顶": "是", "发布时间": "2000/01/01"})
         writer.write(row)
         writer.write({**row, "置顶": "是", "发布时间": "2000/01/01"})
         self.assertEqual([c.args[1] for c in writer.request.call_args_list],
-                         ["blocks/pinned/children", "blocks/daily/children", "blocks/pinned/children"])
-        self.assertEqual(writer.count, 3)
+                         ["blocks/pinned/children", "blocks/pinned/children"])
+        self.assertEqual(writer.count, 2)
+        self.assertEqual(writer.pending_daily, [row])
         writer.close()
 
     def test_pinned_page_created_with_correct_title(self):
@@ -122,6 +123,7 @@ class TodaySyncTests(unittest.TestCase):
                 writer = factory.return_value
                 writer.count = 0
                 writer.daily_page_id = None
+                writer.daily_report = None
                 result = app.run(date_page="invalid-input")
                 today = app.datetime.now(app.LA_TZ).date()
                 factory.assert_called_once_with(today, guard_midnight=True)
@@ -175,6 +177,7 @@ class TodaySyncTests(unittest.TestCase):
             writer = factory.return_value
             writer.count = 0
             writer.daily_page_id = None
+            writer.daily_report = None
             result = app.run(date_page=app.NOTION_PAGE_ID)
             factory.assert_called_once_with(target, guard_midnight=False)
             crawl.assert_called_once_with(target, writer)
@@ -186,8 +189,8 @@ class TodaySyncTests(unittest.TestCase):
         writer.daily_page_id = "historical-day"
         writer.request = Mock(return_value={"results": [{}, {}]})
         writer.write({"发布时间": "2025/01/02", "标题": "历史招聘", "详情URL": "https://example.com/job"})
-        self.assertEqual(writer.count, 1)
-        self.assertEqual(writer.request.call_args.args[1], "blocks/historical-day/children")
+        self.assertEqual(len(writer.pending_daily), 1)
+        writer.request.assert_not_called()
         writer.close()
 
     def test_refresh_dates_are_strict(self):
@@ -238,23 +241,20 @@ class TodaySyncTests(unittest.TestCase):
         self.assertEqual(writer.write.call_count, 2)
         self.assertEqual(csv.call_count, 2)
 
-    def test_notion_append_keeps_existing_content_and_checks_date(self):
+    def test_notion_buffers_daily_content_and_checks_date(self):
         today = app.datetime.now(app.LA_TZ).date()
         with patch.object(app, "load_notion_token", return_value="dummy"):
             writer = app.NotionWriter(today)
-        writer.request = Mock(return_value={"results": [{"id": "heading"}, {"id": "post"}]})
-        writer.daily_page_id = "daily-page"
-        row = {"标题": "测试招聘", "刷新时间": "", "发布时间": str(today), "正文": "正文" * 2000,
+        writer.request = Mock()
+        row = {"帖子ID": "123", "标题": "测试招聘", "发布时间": str(today), "正文": "正文" * 2000,
                "详情URL": "https://example.com/job"}
         writer.write(row)
-        args, kwargs = writer.request.call_args
-        self.assertEqual(args, ("PATCH", "blocks/daily-page/children"))
-        self.assertEqual(writer.count, 1)
-        children = kwargs["json"]["children"][1]["toggle"]["children"]
-        self.assertGreater(len(children), 2)
+        self.assertEqual(writer.pending_daily, [row])
+        self.assertEqual(writer.count, 0)
+        writer.request.assert_not_called()
         with self.assertRaises(ValueError):
-            writer.write({**row, "刷新时间": "2001/01/01", "发布时间": "2001/01/01"})
-        self.assertEqual(writer.request.call_count, 1)
+            writer.write({**row, "发布时间": "2001/01/01"})
+        self.assertEqual(len(writer.pending_daily), 1)
         writer.close()
 
     def test_create_date_page_under_monitor(self):
