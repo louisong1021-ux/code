@@ -145,7 +145,7 @@ class MergeTests(unittest.TestCase):
 
     def test_roundtrip_escape_long_body(self):
         state = d.DailyState()
-        d.merge_posts(state, [row(正文=('电话：不能从这里重新提取 <br> \\ $50\n'*200))])
+        d.merge_posts(state, [row(正文=('电话：不能从这里重新提取 <br> \\ $50\n联系电话： ______________________________\nEmail： _________________________________\n'*200))])
         restored = d.parse_markdown(d.render_markdown(state, DAY))
         self.assertEqual(state.posts, restored.posts)
 

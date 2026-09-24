@@ -22,7 +22,7 @@ BATCH_BYTES = 300_000
 BATCH_POSTS = 90
 MARKER = re.compile(r"^CHINESEINLASYNC(?:START|END)[0-9a-f]{32}$")
 
-SPECIAL = r"\*~`$[]<>{}|^"
+SPECIAL = r"\*~`$[]<>{}|^_"
 DETAILS = re.compile(r"^<details(?: [^>\n]*)?>\n<summary>(.*?)</summary>\n(.*?)\n</details>", re.M | re.S)
 
 
@@ -65,14 +65,16 @@ def escape(text):
 
 
 def unescape(text):
+    # Inline code keeps underscore runs intact through Notion markdown imports.
+    text = re.sub(r"(?<!\\)`(_+)`", r"\1", text)
     # Notion auto-links plain email/URL strings when importing markdown.
     # Recover displayed text, leaving escaped literal markdown untouched.
     text = re.sub(r"(?<!\\)\[((?:\\.|[^\]\\])*)\]\((?:\\.|[^)\n])*\)", r"\1", text)
-    return re.sub(r"\\([\\*~`$\[\]<>{}|^])", r"\1", text)
+    return re.sub(r"\\([\\*~`$\[\]<>{}|^_])", r"\1", text).replace("\t", " ")
 
 
 def inline(text):
-    return escape(text).replace("\r\n", "\n").replace("\n", "<br>")
+    return re.sub(r"(?:\\_)+", lambda m: "`" + m.group(0).replace("\\", "") + "`", escape(text)).replace("\r\n", "\n").replace("\n", "<br>")
 
 
 @dataclass
@@ -160,9 +162,11 @@ def parse_markdown(markdown):
                                     else merge_row(old, row)).row
         else:
             state.posts[pid] = Post(row)
-    residual = text
-    for start, end in reversed(spans):
-        residual = residual[:start] + residual[end:]
+    gaps, cursor = [], 0
+    for start, end in spans:
+        gaps.append(text[cursor:start])
+        cursor = end
+    residual = "".join(gaps) + text[cursor:]
     for line in residual.splitlines():
         line = line.strip()
         if not line or line == "<empty-block/>" or MARKER.fullmatch(line):
